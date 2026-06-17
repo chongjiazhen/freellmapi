@@ -1,20 +1,30 @@
 # Design: provider key-nudge (Phase 1)
 
-Remind the user to add API keys for providers that have enabled catalog models
-but no key — so newly catalog-synced providers don't sit as dead, unusable
-model rows the user never notices.
+Remind the user to add API keys for providers that have enabled models but no
+key — so supported providers don't sit as dead, unusable model rows the user
+never notices.
 
 Upstream context: freellmapi PRs #329/#330 (fusion) merged; this is an
 independent follow-up contribution off `origin/main` (`feat/provider-key-nudge`).
 
 ## Problem
 
-`catalog-sync` pulls new providers' models twice daily (`applyCatalog`,
-`counts.inserted`). `/api/health` only reports platforms that **already have
-keys** (`GROUP BY api_keys`), so a platform with enabled models and zero keys is
-invisible — the user is never told they could unlock N free models by adding one
-key. README provider edits merely trail the catalog; the catalog is the real
-signal.
+A platform can have enabled models and zero keys in three ways, none of which the
+UI surfaces:
+- **Day one** — bundled migrations ship ~18 providers' models; the user adds keys
+  for only a few.
+- **Catalog-sync** — for an *already-supported* provider, models get enabled or
+  added that the user has no key for. (Note: catalog-sync does NOT add support
+  for a *new* provider — `catalog-sync.ts:171` skips models whose platform isn't
+  registered in this binary; new provider support needs a code update. There is
+  no app auto-update.)
+- **After a binary update** — an update registers a new provider; its models
+  appear, still keyless.
+
+`/api/health` only reports platforms that **already have keys** (`GROUP BY
+api_keys`), so a keyless-but-modelled platform is invisible — the user is never
+told they could unlock N free models by adding one key. The value is mostly
+update-independent: the day-one and catalog-sync cases need no update at all.
 
 ## Scope
 
