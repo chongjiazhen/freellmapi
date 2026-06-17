@@ -57,12 +57,14 @@ GROUP BY m.platform
 Then in JS, drop platforms where:
 - `!hasProvider(platform)` — this binary can't route it,
 - the registered provider is `keyless` (pollinations / ovh / kilo route without
-  a key via a sentinel row — nothing to nudge),
-- platform ∈ muted set,
-- platform ∈ snoozed set.
+  a key via a sentinel row — nothing to nudge).
 
-`name` resolved from `getAllProviders()` (`provider.name`). Returns `[]` when
-`disabled` is true.
+`name` resolved from `getAllProviders()` (`provider.name`).
+
+**This list is RAW** — it does NOT apply mute/snooze/disable. Those are dismiss
+state for the *banner only*; the raw list also feeds the permanent dropdown
+annotation (§3b), which must persist after "Don't ask again". The banner derives
+its visible subset on the frontend from the raw list + `nudgeState` (below).
 
 Settings keys (settings table, JSON where noted):
 - `nudge_disabled` — `'1'` / unset.
@@ -73,16 +75,20 @@ Settings keys (settings table, JSON where noted):
 - `'disable'` → set `nudge_disabled = '1'`.
 - `'mute'` (requires `platform`) → add platform to muted set.
 - `'snooze'` (no platform) → overwrite snoozed set with the **currently-shown**
-  platforms (unconfigured − muted). A later brand-new unconfigured provider is
-  not in that set, so the banner re-appears showing only it.
+  platforms — computed server-side as `getUnconfiguredProviders() − muted` — so
+  a later brand-new unconfigured provider isn't in the set and the banner
+  re-appears showing only it.
 
 `pruneNudgeState(platform)` removes a platform from muted + snoozed sets; called
 when a key is added so a re-added-then-removed provider nudges again.
 
 ### 2. Routes
 
-- `GET /api/health` — add `unconfiguredProviders: UnconfiguredProvider[]`
-  (already filtered). Natural home: it already aggregates platform/key state.
+- `GET /api/health` — add `unconfiguredProviders: UnconfiguredProvider[]` (RAW,
+  unfiltered) and `nudgeState: { disabled, muted, snoozed }`. Natural home: it
+  already aggregates platform/key state. The frontend derives the banner's
+  visible set (`raw − muted − snoozed`, hidden when `disabled` or empty); the
+  dropdown annotation uses the raw list directly.
 - `POST /api/keys/nudge` — body `{ scope: 'snooze'|'mute'|'disable', platform?: string }`
   → validate (zod), call `dismissNudge`, return `{ ok: true }`. `mute` without
   `platform` → 400.
@@ -93,7 +99,8 @@ when a key is added so a re-added-then-removed provider nudges again.
 
 Reuses the existing rounded-callout style (`KeysPage.tsx` uses
 `border-… bg-…/10 px-3 py-2.5 text-xs`) in a neutral/info variant (NOT
-destructive). Hidden when the list is empty.
+destructive). Visible set = `unconfiguredProviders − muted − snoozed`; hidden
+when `nudgeState.disabled` is true or the derived set is empty.
 
 ```
 ⓘ  3 providers have free models you're not using — Agnes AI (5),
@@ -110,23 +117,54 @@ destructive). Hidden when the list is empty.
   set the platform `<select>`). Per-provider entries in the menu.
 - `[Dismiss ▾]` → POSTs the chosen scope, then refetches health so the banner
   updates in place.
-- Data: the KeysPage already fetches `/api/health`; read
-  `unconfiguredProviders` off that response (no new fetch wiring).
+- Data: the KeysPage already fetches `/api/health`; read `unconfiguredProviders`
+  + `nudgeState` off that response (no new fetch wiring). Banner derives its
+  visible set client-side; dropdown annotation (§3b) uses the raw list.
 - i18n: add the new strings to `client/src/i18n/locales/en.json` (other locales
   inherit English until translated, matching the repo's existing pattern).
+
+### 3b. AddKeyForm dropdown annotation (permanent reference)
+
+The banner is a transient nudge; the **missing-key state must stay referenceable
+even after "Don't ask again".** Today the only all-providers surface is the
+AddKeyForm platform `<select>`, built from a static client-side `PLATFORMS`
+array — it gives no signal about which providers have free models waiting, and
+the KeysPage provider cards render configured platforms only
+(`grouped … filter(keys.length > 0)`).
+
+Fix, reusing the health data already on the page (zero new UI): when building the
+`<select>` options, join each `PLATFORMS` entry against `unconfiguredProviders`
+and, for a match, append a hint to the label:
+
+```
+Agnes AI · 5 free models, no key
+Zhipu · 3 free models, no key
+Groq                              ← configured, no hint
+```
+
+So the count of unused free models lives permanently in the control used to fix
+it. This is what makes "Don't ask again" safe — it silences the proactive
+banner, not the information. (A provider in the catalog but absent from the
+static `PLATFORMS` array still won't appear here — a pre-existing client/catalog
+sync gap, out of scope for this Phase.)
 
 ## Data flow
 
 ```
 catalog-sync inserts models ─▶ models table
                                    │
-GET /api/health ──▶ getUnconfiguredProviders() ──┬─ SQL (models w/o key)
-                                                 ├─ filter hasProvider/keyless
-                                                 └─ filter muted/snoozed/disabled
-   └─▶ { …, unconfiguredProviders: [...] } ──▶ KeysPage banner
-                                                 │
+GET /api/health ──▶ getUnconfiguredProviders() ─── SQL (models w/o key)
+                      │                              + filter hasProvider/keyless  (RAW)
+                      └─▶ { …, unconfiguredProviders: [...raw],
+                            nudgeState: { disabled, muted, snoozed } }
+                                   │
+                    ┌──────────────┴───────────────┐
+              KeysPage banner                 AddKeyForm dropdown
+         (raw − muted − snoozed,            (annotate options from
+          hidden if disabled/empty)          raw list — always)
+                    │
    banner [Dismiss ▾] ──▶ POST /api/keys/nudge ──▶ dismissNudge() ──▶ settings
-   banner [Add key]  ──▶ AddKeyForm (existing) ──▶ POST /api/keys ──▶ pruneNudgeState()
+   AddKeyForm submit  ──▶ POST /api/keys ──▶ pruneNudgeState()
 ```
 
 ## Error handling
@@ -141,17 +179,24 @@ GET /api/health ──▶ getUnconfiguredProviders() ──┬─ SQL (models w/
 ## Testing
 
 Service unit tests (`provider-nudge.test.ts`):
-- detects a provider with enabled models + no key; excludes one that has a key.
-- excludes `custom`, keyless providers, and `!hasProvider` platforms.
-- `mute` hides only that provider; `disable` hides all; `snooze` hides the
-  current set but a newly-added unconfigured provider reappears.
-- `pruneNudgeState` clears mute/snooze for a platform so it can nudge again.
+- `getUnconfiguredProviders` (raw) detects a provider with enabled models + no
+  key; excludes one that has a key; excludes `custom`, keyless, `!hasProvider`.
+- `dismissNudge('mute', p)` adds `p` to muted; `'disable'` sets the flag;
+  `'snooze'` snapshots `raw − muted` into snoozed, so a later brand-new
+  unconfigured provider is absent from snoozed (banner-visible again).
+- `getNudgeState` round-trips the three settings; corrupt JSON → empty arrays.
+- `pruneNudgeState(p)` clears `p` from muted + snoozed so it can nudge again.
 
 Route tests:
-- `GET /api/health` includes `unconfiguredProviders` with correct counts.
+- `GET /api/health` includes the raw `unconfiguredProviders` (correct counts) and
+  `nudgeState`.
 - each `POST /api/keys/nudge` scope mutates state as expected; `mute` w/o
   platform → 400.
-- adding a key for a nudged provider drops it from the list.
+- adding a key for a nudged provider drops it from the raw list.
+
+Frontend test (KeysPage):
+- dropdown option for an unconfigured provider shows the "· N free models, no
+  key" hint; a configured provider's option does not.
 
 ## Non-goals
 
