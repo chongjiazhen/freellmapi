@@ -204,9 +204,10 @@ Route tests:
   platform → 400.
 - adding a key for a nudged provider drops it from the raw list.
 
-Frontend test (KeysPage):
-- dropdown option for an unconfigured provider shows the "· N free models, no
-  key" hint; a configured provider's option does not.
+Frontend (KeysPage): the client has no test runner (repo convention), so this is
+verified by `tsc -b` + `vite build` + manual smoke — banner derivation, dropdown
+annotation, and dismiss wiring. All branching logic that warrants a unit test
+lives server-side (above).
 
 ## Non-goals
 
