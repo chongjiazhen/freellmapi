@@ -5,11 +5,12 @@ The Register, The Hacker News, PitchBook, scamadviser, and vendor docs; full
 per-provider citations in the research notes below). Basis for running two
 router instances segregated by data-privacy posture:
 
-- **Clean instance** (`:3001` internal / host `:3003`, see
-  `docker-compose.tiers.yml`) — Tier A only. Prompts you would not paste in a
-  public gist may go here.
-- **Gray instance** (the existing default instance) — everything else worth
-  keeping. Assume every prompt is logged and may be used for training.
+- **Clean instance** (host `:3001` — the default port on purpose, so a client
+  that never chose a tier fails safe) — Tier A only. Prompts you would not
+  paste in a public gist may go here.
+- **Gray instance** (host `:3003`, `docker-compose.tiers.yml`) — everything
+  else worth keeping, opt-in for public-grade prompts wanting the full free
+  catalog. Assume every prompt is logged and may be used for training.
 - **Dropped** — providers whose operator risk isn't priced by "prompts are
   public": dead or malicious upstreams also poison fallback chains.
 
@@ -26,7 +27,7 @@ merger), so this table has a shelf life.
 | Ollama Cloud | Policy (rev 2026-03): transient processing, "never train on it"; NVIDIA Cloud partner contracts require zero retention. |
 | OVHcloud AI Endpoints | EU (French public co.), GDPR; zero retention beyond billing metadata, never trains. Keyless tier included. |
 | Requesty | UK/EU, ZDR mode, encrypted EU storage max 30 days when logging on; no training; GDPR/SOC2 claims. |
-| Mistral * | **Conditional**: free Experiment tier trains BY DEFAULT. Tier A only after flipping Admin Console → Privacy opt-out. EU jurisdiction. |
+| Mistral * | **Conditional**: free Experiment tier trains BY DEFAULT. Tier A only after flipping Admin Console → Privacy opt-out. EU jurisdiction. Currently DISABLED on the clean instance (opt-out not yet flipped); enabled on gray. |
 
 ## Tier B — gray (assume logged; case-by-case)
 

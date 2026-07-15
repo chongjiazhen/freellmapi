@@ -11,7 +11,7 @@ server/data/
 .env
 .env.local
 # Tier-instance secrets (examples are committed; real copies are not)
-.env.clean
+.env.gray
 docker/tiers/clean.config.json
 docker/tiers/gray.config.json
 .DS_Store

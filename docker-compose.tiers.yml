@@ -1,31 +1,35 @@
 # Tier-segregated second instance (see docs/provider-tiers.md).
 #
-#   freellmapi        (docker-compose.yml)  -> gray tier, host :3001 (existing)
-#   freellmapi-clean  (this file)           -> Tier A only, host :3003
+#   freellmapi       (docker-compose.yml)  -> CLEAN tier (Tier A only), host :3001
+#   freellmapi-gray  (this file)           -> GRAY tier (everything else), host :3003
+#
+# The default instance/port is the privacy-safe one on purpose: a client that
+# never chose a tier fails safe. Gray is opt-in for public-grade prompts that
+# want the full free-model catalog.
 #
 # Run both:
 #   docker compose -f docker-compose.yml -f docker-compose.tiers.yml up -d
 #
-# Setup used here: the clean instance's volume is a CLONE of the gray
-# instance's (all keys pre-configured, same ENCRYPTION_KEY — .env.clean is a
-# copy of .env plus CLEAN_PORT), then non-Tier-A platforms are disabled in the
-# clean DB (api_keys.enabled=0). docker/tiers/*.config.example.json remain as
-# the from-scratch alternative via FREEAPI_CONFIG_PATH.
+# Setup used here: the gray instance's volume started as a CLONE of the default
+# instance's (all keys pre-configured, same ENCRYPTION_KEY — .env.gray is a copy
+# of .env plus GRAY_PORT), then tiers were assigned by flipping api_keys.enabled
+# in each DB. docker/tiers/*.config.example.json remain as the from-scratch
+# alternative via FREEAPI_CONFIG_PATH.
 services:
-  freellmapi-clean:
+  freellmapi-gray:
     image: ghcr.io/tashfeenahmed/freellmapi:latest
     build:
       context: .
       dockerfile: Dockerfile
     env_file:
-      - .env.clean
+      - .env.gray
     environment:
       NODE_ENV: production
       PORT: 3001
     ports:
-      - "${HOST_BIND:-127.0.0.1}:${CLEAN_PORT:-3003}:3001"
+      - "${HOST_BIND:-127.0.0.1}:${GRAY_PORT:-3003}:3001"
     volumes:
-      - freellmapi-clean-data:/app/server/data
+      - freellmapi-gray-data:/app/server/data
     restart: unless-stopped
     healthcheck:
       test:
@@ -41,4 +45,7 @@ services:
       retries: 3
 
 volumes:
-  freellmapi-clean-data:
+  freellmapi-gray-data:
+    # Historical name: this volume was created as a clone of the default
+    # instance's data before the tier roles were swapped onto :3001/:3003.
+    name: freellmapi_freellmapi-clean-data
