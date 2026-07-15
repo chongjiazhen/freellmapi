@@ -35,7 +35,7 @@ merger), so this table has a shelf life.
 |---|---|
 | Google (Gemini free) | Free tier trains on prompts with human review; EEA/UK carve-out gets paid-tier terms. |
 | Groq | Good policy (no-train, 7-day logs, ZDR option) but NVIDIA acqui-hire 2025-12-24; policy continuity under new leadership unproven. Groq ≠ Grok/xAI. |
-| GitHub Models | Microsoft flipped Copilot free tiers to default-training 2026-04-24; Models API scope unverified — check account opt-out. |
+| GitHub Models | Microsoft flipped Copilot free tiers to default-training 2026-04-24. Account toggle "Allow GitHub to use my data for AI model training" verified Disabled 2026-07-15; whether Models API inference is inside that toggle's scope remains unverified, so stays gray. |
 | OpenRouter | Itself clean (no prompt logging, ZDR param) but `:free` routes terminate at train-happy third-party hosts. Account Data Policies verified 2026-07-15: paid-may-train OFF, free-may-train ON (keeps the :free catalog; gray assumption covers it), free-may-publish OFF, 1% data discount OFF, ZDR enforcement off. |
 | HuggingFace Router | Fans out to ~7 partner hosts with heterogeneous retention; weak platform security record (2 RCE CVEs in 2026). |
 | SiliconFlow | Singapore paper entity, Beijing operations; policy silent on training, vague retention. |
