@@ -27,7 +27,7 @@ merger), so this table has a shelf life.
 | Ollama Cloud | Policy (rev 2026-03): transient processing, "never train on it"; NVIDIA Cloud partner contracts require zero retention. |
 | OVHcloud AI Endpoints | EU (French public co.), GDPR; zero retention beyond billing metadata, never trains. Keyless tier included. |
 | Requesty | UK/EU, ZDR mode, encrypted EU storage max 30 days when logging on; no training; GDPR/SOC2 claims. |
-| Mistral * | **Conditional**: free Experiment tier trains BY DEFAULT. Tier A only after flipping Admin Console → Privacy opt-out. EU jurisdiction. Currently DISABLED on the clean instance (opt-out not yet flipped); enabled on gray. |
+| Mistral * | **Conditional**: free Experiment tier trains BY DEFAULT. Tier A only with Admin Console → Privacy → "Allow the use of your API calls to train" OFF — flipped 2026-07-15, so enabled on clean. Keep "Labs models" OFF too: Labs trains regardless of the opt-out. EU jurisdiction. |
 
 ## Tier B — gray (assume logged; case-by-case)
 
