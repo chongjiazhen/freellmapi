@@ -6,13 +6,11 @@
 # Run both:
 #   docker compose -f docker-compose.yml -f docker-compose.tiers.yml up -d
 #
-# One-time setup for the clean instance:
-#   cp docker/tiers/clean.config.example.json docker/tiers/clean.config.json
-#   cp .env.clean.example .env.clean            # fresh ENCRYPTION_KEY, real keys
-# The declarative config is applied idempotently on every boot. NOTE: a key
-# entry OVERWRITES any key stored via the dashboard for that platform — either
-# keep real keys in clean.config.json, or remove the entry after first boot
-# and manage the key from the dashboard.
+# Setup used here: the clean instance's volume is a CLONE of the gray
+# instance's (all keys pre-configured, same ENCRYPTION_KEY — .env.clean is a
+# copy of .env plus CLEAN_PORT), then non-Tier-A platforms are disabled in the
+# clean DB (api_keys.enabled=0). docker/tiers/*.config.example.json remain as
+# the from-scratch alternative via FREEAPI_CONFIG_PATH.
 services:
   freellmapi-clean:
     image: ghcr.io/tashfeenahmed/freellmapi:latest
@@ -24,12 +22,10 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3001
-      FREEAPI_CONFIG_PATH: /app/server/data/clean.config.json
     ports:
       - "${HOST_BIND:-127.0.0.1}:${CLEAN_PORT:-3003}:3001"
     volumes:
       - freellmapi-clean-data:/app/server/data
-      - ./docker/tiers/clean.config.json:/app/server/data/clean.config.json:ro
     restart: unless-stopped
     healthcheck:
       test:
