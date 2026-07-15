@@ -10,6 +10,10 @@ server/data/
 .encryption-key
 .env
 .env.local
+# Tier-instance secrets (examples are committed; real copies are not)
+.env.clean
+docker/tiers/clean.config.json
+docker/tiers/gray.config.json
 .DS_Store
 
 # Personal deployment scripts (contain keys/credentials — kept local)

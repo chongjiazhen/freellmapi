@@ -1,0 +1,23 @@
+{
+  "keys": [
+    { "platform": "google", "key": "REPLACE", "label": "gray" },
+    { "platform": "groq", "key": "gsk_REPLACE", "label": "gray" },
+    { "platform": "github", "key": "github_pat_REPLACE", "label": "gray" },
+    { "platform": "openrouter", "key": "sk-or-REPLACE", "label": "gray (account training toggle OFF)" },
+    { "platform": "huggingface", "key": "hf_REPLACE", "label": "gray" },
+    { "platform": "nvidia", "key": "nvapi-REPLACE", "label": "gray (trains on prompts)" },
+    { "platform": "cohere", "key": "REPLACE", "label": "gray (trial keys train, no opt-out)" },
+    { "platform": "zhipu", "key": "REPLACE", "label": "gray (mainland bigmodel.cn)" },
+    { "platform": "siliconflow", "key": "sk-REPLACE", "label": "gray" },
+    { "platform": "reka", "key": "REPLACE", "label": "gray (free tier trains)" },
+    { "platform": "opencode", "key": "REPLACE", "label": "gray (free models train)" },
+    { "platform": "agnes", "key": "REPLACE", "label": "gray (opaque policy)" },
+    { "platform": "llm7", "key": "REPLACE", "label": "gray (individual operator)" },
+    { "platform": "bazaarlink", "key": "REPLACE", "label": "gray" },
+    { "platform": "ainative", "key": "REPLACE", "label": "gray" },
+    { "platform": "aion", "key": "REPLACE", "label": "gray" },
+    { "platform": "kilo", "label": "gray keyless (logs + trains by design)" },
+    { "platform": "pollinations", "label": "gray keyless" },
+    { "platform": "aihorde", "label": "gray keyless (prompts visible to volunteer workers)" }
+  ]
+}

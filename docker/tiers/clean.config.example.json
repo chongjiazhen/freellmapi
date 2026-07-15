@@ -1,0 +1,13 @@
+{
+  "keys": [
+    { "platform": "cerebras", "key": "csk-REPLACE", "label": "tier-a" },
+    { "platform": "cloudflare", "key": "ACCOUNT_ID:API_TOKEN", "label": "tier-a" },
+    { "platform": "ollama", "key": "REPLACE", "label": "tier-a" },
+    { "platform": "requesty", "key": "REPLACE", "label": "tier-a" },
+    { "platform": "mistral", "key": "REPLACE", "label": "tier-a (privacy opt-out flipped in Mistral console)" },
+    { "platform": "ovh", "label": "tier-a keyless" }
+  ],
+  "routing": {
+    "strategy": "reliable"
+  }
+}
