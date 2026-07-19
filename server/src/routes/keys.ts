@@ -8,6 +8,7 @@ import { resolveProvider } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../lib/key-parser.js';
 import { assessProviderUrl } from '../lib/url-guard.js';
+import { ensureModelInProfiles } from '../services/profile-models.js';
 
 export const keysRouter = Router();
 
@@ -19,7 +20,7 @@ const PLATFORMS = [
   'google', 'groq', 'cerebras', 'nvidia', 'mistral',
   'openrouter', 'github', 'cohere', 'cloudflare', 'zhipu', 'ollama',
   'kilo', 'pollinations', 'llm7', 'huggingface', 'opencode', 'ovh', 'agnes', 'reka', 'siliconflow',
-  'routeway', 'bazaarlink', 'ainative', 'aion', 'requesty', 'nara', 'aihorde', 'custom',
+  'routeway', 'bazaarlink', 'ainative', 'aion', 'requesty', 'navy', 'nara', 'sealion', 'aihorde', 'custom',
 ] as const;
 
 const ALLOWED_IMPORT_EXTENSIONS = new Set(['.env', '.json', '.jsonc', '.md', '.txt', '.csv']);
@@ -526,6 +527,7 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
         const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
         db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
       }
+      ensureModelInProfiles(db, modelRow.id);
 
       registered.push({
         modelDbId: modelRow.id,
