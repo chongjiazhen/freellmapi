@@ -1175,11 +1175,23 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // in parallel, then a judge synthesizes one answer. It routes each panel/judge
   // sub-call through the normal path (cooldowns, quotas, analytics), so it
   // behaves like a normal model from the client's side — just K+1x the tokens.
-  // Vision is still rejected up front; tool requests run on tool-capable panel
-  // members and return the first structured tool call directly.
+  // Vision is rejected up front. Tool requests are ALSO rejected here: this is a
+  // LOCAL divergence from upstream (which races tool-capable panel members and
+  // returns the first structured tool call). Fusion is our commander-only path -
+  // it exists to fuse REASONING turns, where a diverse panel plus a judge beats
+  // any single model. A tool call is an action, not prose: it cannot be
+  // synthesized, so on a tools-bearing request fusion silently collapses to a
+  // first-past-the-post race with the judge skipped - all the token cost, none
+  // of the value, and undetectable from the response. Workers do tool-calling
+  // via `auto` or a pinned model; fusion never does. Failing loud keeps that
+  // topology invariant enforced at the one chokepoint every client shares.
   if (isFusionModel(requestedModel)) {
     if (hasImage) {
       res.status(422).json({ error: { message: 'Fusion does not support image input yet. Use a vision model directly.', type: 'invalid_request_error', code: 'fusion_no_vision' } });
+      return;
+    }
+    if ((tools?.length ?? 0) > 0) {
+      res.status(422).json({ error: { message: 'Fusion is for tool-free reasoning turns only. Use `auto` (or a specific model) for tool-calling.', type: 'invalid_request_error', code: 'fusion_no_tools' } });
       return;
     }
     const fusionOptions = { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams };

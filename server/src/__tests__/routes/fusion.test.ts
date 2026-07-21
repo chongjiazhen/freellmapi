@@ -246,16 +246,19 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
     expect(body.x_fusion.dropped.some((d: string) => d.includes('no-such-model'))).toBe(true);
   });
 
-  it('returns the first structured panel tool_call instead of judging actions', async () => {
-    const toolCalls = [{
-      id: 'call_weather',
-      type: 'function',
-      function: { name: 'get_weather', arguments: '{"city":"Karachi"}' },
-    }];
+  // LOCAL DIVERGENCE from upstream. Upstream races tool-capable panel members and
+  // returns the first structured tool call (two tests removed here asserted that:
+  // "returns the first structured panel tool_call instead of judging actions" and
+  // "keeps tool-bearing fusion panels on tool-capable models even with tool_choice
+  // none"). We reject tool-bearing fusion requests instead: fusion is our
+  // commander-only path for tool-FREE reasoning turns; tool-calling goes through
+  // `auto` or a pinned model. See the fusion_no_tools guard in routes/proxy.ts.
+  // If this test conflicts on a rebase, upstream changed the tool path and the
+  // divergence decision needs re-confirming.
+  it('rejects a tool-bearing fusion request with 422 fusion_no_tools (local divergence)', async () => {
     const upstream = mockUpstreams({
-      'api.groq.com': { content: null, tool_calls: toolCalls, finish_reason: 'stop' },
-      'api.cerebras.ai': 'cerebras text should not be judged when a tool call wins',
-      'openrouter.ai': 'JUDGE SHOULD NOT RUN',
+      'api.groq.com': 'PANEL MUST NOT RUN',
+      'api.cerebras.ai': 'PANEL MUST NOT RUN',
     });
 
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
@@ -265,40 +268,22 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
         type: 'function',
         function: {
           name: 'get_weather',
-          description: 'Get current weather',
-          parameters: {
-            type: 'object',
-            properties: { city: { type: 'string' } },
-            required: ['city'],
-          },
+          parameters: { type: 'object', properties: { city: { type: 'string' } } },
         },
       }],
-      tool_choice: 'required',
-      parallel_tool_calls: true,
-      fusion: { models: [toolGroqModel, toolCerebrasModel], judge: openrouterModel, expose_panel: true },
+      fusion: { models: [toolGroqModel, toolCerebrasModel], expose_panel: true },
     }, authHeaders());
 
-    expect(status).toBe(200);
-    expect(body.model).toBe('fusion');
-    expect(body.choices[0].finish_reason).toBe('tool_calls');
-    expect(body.choices[0].message.content).toBeNull();
-    expect(body.choices[0].message.tool_calls).toEqual(toolCalls);
-    expect(body._fusion.tool_call_winner).toEqual({ platform: 'groq', model: toolGroqModel });
-    expect(body.x_fusion.tool_call_winner).toEqual({ platform: 'groq', model: toolGroqModel });
-    expect(body.x_fusion.panel.find((p: any) => p.platform === 'groq').tool_calls).toEqual(toolCalls);
-
-    const groqCall = upstream.calls.find(c => c.url.includes('api.groq.com'));
-    expect(groqCall?.body.tools).toHaveLength(1);
-    expect(groqCall?.body.tool_choice).toBe('required');
-    expect(groqCall?.body.parallel_tool_calls).toBe(true);
-    expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('fusion_no_tools');
+    // Rejected up front: no panel or judge sub-call is dispatched to any provider.
+    // (upstream.calls also records the harness's own request to the app, so assert
+    // on provider hosts, not total count.)
+    expect(upstream.calls.some(c => /api\.groq\.com|api\.cerebras\.ai/.test(c.url))).toBe(false);
   });
 
-  it('keeps tool-bearing fusion panels on tool-capable models even with tool_choice none', async () => {
-    const upstream = mockUpstreams({
-      'api.groq.com': 'groq handled a no-tool turn',
-      'openrouter.ai': 'NON-TOOL MODEL SHOULD NOT RUN',
-    });
+  it('rejects tool-bearing fusion even with tool_choice none (local divergence)', async () => {
+    const upstream = mockUpstreams({ 'api.groq.com': 'PANEL MUST NOT RUN' });
 
     const { status, body } = await request(app, 'POST', '/v1/chat/completions', {
       model: 'fusion',
@@ -314,14 +299,11 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
       fusion: { models: [nonToolOpenrouterModel, toolGroqModel], expose_panel: true },
     }, authHeaders());
 
-    expect(status).toBe(200);
-    expect(body.choices[0].message.content).toBe('groq handled a no-tool turn');
-    expect(body.x_fusion.dropped).toContain(`${nonToolOpenrouterModel} (no tool-calling support)`);
-    expect(upstream.calls.some(c => c.url.includes('openrouter.ai'))).toBe(false);
-
-    const groqCall = upstream.calls.find(c => c.url.includes('api.groq.com'));
-    expect(groqCall?.body.tools).toHaveLength(1);
-    expect(groqCall?.body.tool_choice).toBe('none');
+    // Even tool_choice:'none' carries a tools array; the request is still shaped
+    // for tool use, so the topology invariant rejects it rather than guessing.
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('fusion_no_tools');
+    expect(upstream.calls.some(c => /api\.groq\.com/.test(c.url))).toBe(false);
   });
 
   it('tags every panel/judge sub-call with requested_model="fusion"', async () => {
@@ -541,19 +523,20 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
     expect(text.indexOf('"event":"panel"')).toBeLessThan(text.indexOf('STREAMED SYNTHESIS'));
   });
 
-  it('streams fusion tool_calls as OpenAI chunks with terminal tool_calls finish_reason', async () => {
-    const toolCalls = [{
-      id: 'call_weather_stream',
-      type: 'function',
-      function: { name: 'get_weather', arguments: '{"city":"Dublin"}' },
-    }];
-    mockUpstreams({
-      'api.groq.com': { content: null, tool_calls: toolCalls, finish_reason: 'tool_calls' },
-      'api.cerebras.ai': 'text answer loses to structured tool call',
-      'openrouter.ai': 'JUDGE SHOULD NOT RUN',
+  // LOCAL DIVERGENCE (see the non-streaming rejection tests above). Upstream
+  // streamed the first panel tool_call as OpenAI chunks; the removed test was
+  // "streams fusion tool_calls as OpenAI chunks with terminal tool_calls
+  // finish_reason". The fusion_no_tools guard fires BEFORE the stream branch, so
+  // a streaming tool-bearing request is rejected as a plain JSON 422, never an
+  // SSE stream - the client learns immediately rather than opening a doomed
+  // stream.
+  it('rejects a streaming tool-bearing fusion request as a JSON 422, not an SSE stream (local divergence)', async () => {
+    const upstream = mockUpstreams({
+      'api.groq.com': 'PANEL MUST NOT RUN',
+      'api.cerebras.ai': 'PANEL MUST NOT RUN',
     });
 
-    const { status, text } = await request(app, 'POST', '/v1/chat/completions', {
+    const { status, body, text } = await request(app, 'POST', '/v1/chat/completions', {
       model: 'fusion',
       stream: true,
       messages: [{ role: 'user', content: 'Weather in Dublin?' }],
@@ -561,32 +544,18 @@ describe('fusion route (/v1/chat/completions, model: "fusion")', () => {
         type: 'function',
         function: {
           name: 'get_weather',
-          parameters: {
-            type: 'object',
-            properties: { city: { type: 'string' } },
-            required: ['city'],
-          },
+          parameters: { type: 'object', properties: { city: { type: 'string' } } },
         },
       }],
       tool_choice: 'required',
       fusion: { models: [toolGroqModel, toolCerebrasModel], judge: openrouterModel },
     }, authHeaders());
-    expect(status).toBe(200);
 
-    const frames = text.split('\n')
-      .filter(l => l.startsWith('data: ') && l.slice(6).trim() !== '[DONE]')
-      .map(l => JSON.parse(l.slice(6)));
-
-    const traceFrames = frames.filter(f => f._fusion);
-    expect(traceFrames.length).toBeGreaterThan(0);
-    expect(traceFrames.every(f => Array.isArray(f.choices))).toBe(true);
-    expect(traceFrames.some(f => f._fusion?.tool_calls?.[0]?.id === 'call_weather_stream')).toBe(true);
-
-    const toolFrame = frames.find(f => f.choices?.[0]?.delta?.tool_calls);
-    expect(toolFrame.choices[0].delta.tool_calls).toEqual(toolCalls);
-    expect(frames.map(f => f.choices?.[0]?.finish_reason).filter(Boolean)).toEqual(['tool_calls']);
-    expect(text).not.toContain('JUDGE SHOULD NOT RUN');
-    expect(text.trimEnd().endsWith('data: [DONE]')).toBe(true);
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('fusion_no_tools');
+    // A JSON error body, not an SSE stream: no data frames, no [DONE].
+    expect(text).not.toContain('data:');
+    expect(upstream.calls.some(c => /api\.groq\.com|api\.cerebras\.ai/.test(c.url))).toBe(false);
   });
 });
 
