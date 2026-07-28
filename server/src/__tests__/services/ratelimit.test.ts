@@ -402,4 +402,22 @@ describe('parseRetryAfterMs', () => {
     expect(parseRetryAfterMs('')).toBeUndefined();
     expect(parseRetryAfterMs('soon')).toBeUndefined();
   });
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it('clamps an absurd delta-seconds value to 24h', () => {
+    // Feeds the cooldown expiry directly, so an unclamped value benches the key
+    // effectively forever.
+    expect(parseRetryAfterMs('99999999999')).toBe(DAY_MS);
+    expect(parseRetryAfterMs(String(DAY_MS / 1000 + 1))).toBe(DAY_MS);
+  });
+
+  it('clamps a far-future HTTP-date to 24h', () => {
+    expect(parseRetryAfterMs(new Date(Date.now() + 30 * DAY_MS).toUTCString())).toBe(DAY_MS);
+  });
+
+  it('leaves values at or under 24h untouched', () => {
+    expect(parseRetryAfterMs(String(DAY_MS / 1000))).toBe(DAY_MS);
+    expect(parseRetryAfterMs('3600')).toBe(3_600_000);
+  });
 });

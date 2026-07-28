@@ -7,6 +7,7 @@ import { supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { getRoutingScores, getRoutingStrategy, setRoutingStrategy } from '../services/router.js';
 import type { RoutingStrategy } from '../services/scoring.js';
 import { getCacheStats } from '../services/cache.js';
+import { getCompressionStats } from '../services/compression/stats.js';
 
 // ─────────────────────────────────────────────────────────────────────────
 // MCP server for the gateway (POST /mcp) — Model Context Protocol over
@@ -233,6 +234,11 @@ const TOOLS: Record<string, McpTool> = {
     inputSchema: { type: 'object', properties: {} },
     run: () => getCacheStats(),
   },
+  compression_stats: {
+    description: 'Prompt-compression statistics: requests compressed, estimated tokens saved, fidelity-gate discards, and per-engine savings.',
+    inputSchema: { type: 'object', properties: {} },
+    run: () => getCompressionStats(),
+  },
 };
 
 // ── JSON-RPC dispatch ────────────────────────────────────────────────────
@@ -256,7 +262,7 @@ function dispatchRpc(msg: JsonRpcRequest, id: number | string | null): unknown {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'freellmapi', version: '1.0.0' },
-        instructions: 'FreeLLMAPI gateway introspection: list usable free models (with per-model supported_parameters), check provider/key health, read usage and cache stats, and switch the routing strategy. Inference goes through the OpenAI-compatible /v1 endpoints, not MCP.',
+        instructions: 'FreeLLMAPI gateway introspection: list usable free models (with per-model supported_parameters), check provider/key health, read usage/cache/compression stats, and switch the routing strategy. Inference goes through the OpenAI-compatible /v1 endpoints, not MCP.',
       });
     }
     case 'ping':

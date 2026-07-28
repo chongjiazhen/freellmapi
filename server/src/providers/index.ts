@@ -40,13 +40,16 @@ register(new OpenAICompatProvider({
 // ("This model only supports single tool-calls at once!"), so pin
 // parallel_tool_calls to false when tools are present. See issue #255.
 // Reasoning models (deepseek-v4-pro, llama-4-maverick, llama-3.1/3.3-70b) take
-// 30-60s on cold start; the default 15s false-flags them as broken. 90s.
+// 30-60s on cold start; the default 15s false-flags them as broken. 180s:
+// NIM sends SSE headers instantly, then prefills 100k-token prompts for
+// minutes before the first byte, and this value doubles as the streaming
+// first-byte grace budget (#584). Env-tunable via PROVIDER_TIMEOUT_NVIDIA.
 register(new OpenAICompatProvider({
   platform: 'nvidia',
   name: 'NVIDIA NIM',
   baseUrl: 'https://integrate.api.nvidia.com/v1',
   forceSingleToolCall: true,
-  timeoutMs: 90_000,
+  timeoutMs: 180_000,
 }));
 
 // Mistral - OpenAI-compatible
@@ -143,21 +146,14 @@ register(new OpenAICompatProvider({
   keyless: true,
 }));
 
-// Pollinations — OpenAI-compatible, anonymous tier. The chat completions
-// endpoint lives at `/openai/v1/chat/completions` (NOT `/v1/...` — the
-// `/openai` prefix is mandatory). Public model list returns one anonymous
-// model (`openai-fast` = GPT-OSS 20B on OVH, tools=true).
-// Registered keyless (June 2026): the legacy text API is deprecated for
-// AUTHENTICATED users (replacement enter.pollinations.ai is pay-as-you-go
-// "pollen"), while anonymous access is explicitly unaffected — so the anon
-// path is the only recurring-free one left. Anon is queue-limited to 1
-// concurrent request per IP (429 "Queue full" on overlap; live-probed
-// 2026-06-10).
+// Pollinations — OpenAI-compatible recurring shared-capacity tier. The legacy
+// text.pollinations.ai host returned 502 in the July 2026 audit; publishable
+// keys now use the unified gen.pollinations.ai endpoint. Free capacity accrues
+// at one pollen per IP per hour, so chat requires a real publishable key.
 register(new OpenAICompatProvider({
   platform: 'pollinations',
   name: 'Pollinations',
-  baseUrl: 'https://text.pollinations.ai/openai/v1',
-  keyless: true,
+  baseUrl: 'https://gen.pollinations.ai/v1',
 }));
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access

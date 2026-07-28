@@ -10,17 +10,20 @@ import type {
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
 import { routeRequest, routingReserveTokens, type RouteResult } from '../services/router.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
-import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
+import type { ReasoningEffort } from '../lib/sampling-params.js';
 import { buildModelListing } from '../services/model-listing.js';
+import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
 // translation layer over the SAME router/fallback/analytics machinery the
@@ -86,16 +89,44 @@ const messagesSchema = z.object({
   stop_sequences: z.array(z.string()).optional(),
   tools: z.array(anthropicToolSchema).optional(),
   tool_choice: anthropicToolChoiceSchema.optional(),
+  // Anthropic's native extended-thinking knob. Mapped onto the internal
+  // reasoning_effort (see effortFromAnthropicThinking) so providers with
+  // request-side reasoning control receive it; platforms without support have
+  // it stripped by the policy in lib/sampling-params.ts.
+  thinking: z.object({
+    type: z.enum(['enabled', 'disabled']).optional(),
+    budget_tokens: z.number().int().optional(),
+  }).passthrough().nullable().optional(),
 }).passthrough();
 
 type AnthropicRequest = z.infer<typeof messagesSchema>;
+
+// Anthropic expresses reasoning control as a token budget; our internal knob
+// is OpenAI's coarse effort scale. Thresholds follow Anthropic's own guidance
+// bands (minimum budget 1024; multi-10k budgets for hard problems).
+export function effortFromAnthropicThinking(
+  thinking: { type?: string; budget_tokens?: number } | null | undefined,
+): ReasoningEffort | undefined {
+  if (!thinking) return undefined;
+  if (thinking.type === 'disabled') return 'none';
+  const budget = thinking.budget_tokens;
+  if (budget == null) return 'medium';
+  if (budget < 4096) return 'low';
+  if (budget < 16384) return 'medium';
+  return 'high';
+}
 
 // ── Response shape ──────────────────────────────────────────────────────────
 type AnthropicStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
 
 interface AnthropicTextBlock { type: 'text'; text: string }
 interface AnthropicToolUseBlock { type: 'tool_use'; id: string; name: string; input: unknown; thought_signature?: string }
-type AnthropicResponseBlock = AnthropicTextBlock | AnthropicToolUseBlock;
+// The model's reasoning trace, rendered on Anthropic's native wire shape. The
+// signature field is required by the shape but is only meaningful for real
+// Anthropic models (replay verification); empty here. Our request converter
+// drops thinking blocks on the way in, so replay is safe.
+interface AnthropicThinkingBlock { type: 'thinking'; thinking: string; signature: string }
+type AnthropicResponseBlock = AnthropicTextBlock | AnthropicToolUseBlock | AnthropicThinkingBlock;
 
 interface AnthropicMessageResponse {
   id: string;
@@ -113,15 +144,34 @@ function sendError(res: Response, status: number, errorType: string, message: st
 }
 
 // The shared exhaustion body's `type` strings are chosen to be valid on the
-// OpenAI-shaped surfaces; the all-keys-failed-auth exhaustion carries
-// 'provider_error' and the circuit-breaker stop carries 'service_unavailable',
-// neither of which is an Anthropic error type. Remap them onto Anthropic's
-// vocabulary ('api_error' / 'overloaded_error') so this surface stays
-// wire-correct.
+// OpenAI-shaped surfaces; several of them are not Anthropic error types. Remap
+// them onto Anthropic's vocabulary via the body's coarse `kind` so this
+// surface stays wire-correct: auth/upstream failures → 'api_error', pool
+// unavailability → 'overloaded_error', context exhaustion → Anthropic's 413
+// 'request_too_large', model-gone → 'not_found_error'.
 function anthropicErrorType(body: ExhaustionBody): string {
-  if (body.kind === 'auth') return 'api_error';
+  if (body.kind === 'auth' || body.kind === 'upstream') return 'api_error';
   if (body.kind === 'unavailable') return 'overloaded_error';
+  if (body.kind === 'context_too_large') return 'request_too_large';
+  if (body.kind === 'model_not_found') return 'not_found_error';
   return body.type;
+}
+
+// Render an exhaustion body on the Anthropic wire shape, carrying the
+// machine-readable extras (`code`, `retryAtMs`) alongside Anthropic's standard
+// type/message and stamping the matching Retry-After header. Extra keys on the
+// error object are ignored by Anthropic SDKs, so this stays wire-compatible.
+function sendExhaustion(res: Response, body: ExhaustionBody): void {
+  setExhaustionHeaders(res, body);
+  res.status(body.status).json({
+    type: 'error',
+    error: {
+      type: anthropicErrorType(body),
+      message: body.message,
+      ...(body.code ? { code: body.code } : {}),
+      ...(body.retryAtMs != null ? { retryAtMs: body.retryAtMs } : {}),
+    },
+  });
 }
 
 function newMessageId(): string {
@@ -317,6 +367,13 @@ function parseToolInput(raw: string): unknown {
 
 function toAnthropicContent(message: ChatMessage | undefined): AnthropicResponseBlock[] {
   const blocks: AnthropicResponseBlock[] = [];
+  // Reasoning output (native provider reasoning_content, or extracted from an
+  // inline <think> block by lib/think-tags.ts) → Anthropic thinking block,
+  // first per Anthropic convention.
+  const reasoning = message?.reasoning_content;
+  if (typeof reasoning === 'string' && reasoning.length > 0) {
+    blocks.push({ type: 'thinking', thinking: reasoning, signature: '' });
+  }
   const text = contentToString(message?.content ?? '');
   if (text.length > 0) blocks.push({ type: 'text', text });
   for (const call of message?.tool_calls ?? []) {
@@ -369,6 +426,9 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
   const body = parsed.data;
   const requestedModel = body.model ?? 'auto';
+  const routedModel = body.model?.startsWith('claude/')
+    ? body.model.slice('claude/'.length)
+    : body.model;
   // The Anthropic wire format requires max_tokens, but OUR default injection
   // must not change the budget gate's verdict: gating AFTER defaulting made a
   // no-max_tokens request 413 here (input + 1024 over budget) where the chat
@@ -377,7 +437,24 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const clientMaxTokens = body.max_tokens != null && body.max_tokens > 0 ? body.max_tokens : undefined;
   const { temperature, top_p, stream } = body;
 
-  const { messages, tools, tool_choice, hasImage, wantsTools } = convertRequest(body);
+  const converted = convertRequest(body);
+  let { messages } = converted;
+  const { tools, tool_choice, hasImage, wantsTools } = converted;
+  const systemHasCacheControl = Array.isArray(body.system)
+    && body.system.some(block => block && typeof block === 'object' && 'cache_control' in block);
+  const messageHasCacheControl = body.messages.some(message =>
+    Array.isArray(message.content)
+    && message.content.some(block => block && typeof block === 'object' && 'cache_control' in block));
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    // Claude Code normally marks the system prefix. If a later native message
+    // carries a breakpoint, conservatively cap the translated prefix at
+    // lossless rather than risk invalidating upstream prompt-cache semantics.
+    cacheControlPrefixLength: messageHasCacheControl ? messages.length : (systemHasCacheControl ? 1 : 0),
+  });
+  messages = compressionResult.messages;
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
 
   const estimatedInputTokens = estimateTokens(messages);
   const imageCount = messages.reduce((n, m) =>
@@ -394,7 +471,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const max_tokens = clientMaxTokens
     ?? (budgetCheck.maxTokens != null ? Math.min(DEFAULT_MAX_TOKENS, budgetCheck.maxTokens) : DEFAULT_MAX_TOKENS);
 
-  const completionOptions = { temperature, max_tokens, top_p, top_k: body.top_k ?? undefined, tools, tool_choice };
+  const completionOptions = {
+    temperature, max_tokens, top_p, top_k: body.top_k ?? undefined, tools, tool_choice,
+    // Native `thinking: {type, budget_tokens}` → the same internal knob the
+    // OpenAI surface's reasoning_effort feeds; absent when the client sent none.
+    reasoning_effort: effortFromAnthropicThinking(body.thinking),
+  };
   // Capped output reserve so a large max_tokens can't falsely exclude the model
   // pool (#470); input + images count in full.
   const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + routingReserveTokens(max_tokens);
@@ -402,7 +484,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   // Resolve the model through the operator's Claude-family map (opus/sonnet/
   // haiku/default → auto | a pinned catalog model). A concrete catalog id pins
   // directly. `pinned` drives the analytics requested-model label.
-  const resolved = resolveAnthropicModel(body.model);
+  const resolved = resolveAnthropicModel(routedModel);
   const pinnedModelId = resolved.pinned ? (body.model ?? null) : null;
 
   // Session affinity: Claude Code stamps every request in a session with
@@ -422,8 +504,21 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   // inline tool-call dialect rescue that the OpenAI/Responses surfaces carry.
   const state = newFallbackState();
   const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
   let clientGone = false;
-  res.on('close', () => { if (!res.writableEnded) clientGone = true; });
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
+    }
+  });
+  const dispatchOptions = { ...completionOptions, signal: clientAbort.signal };
 
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
@@ -434,7 +529,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     dispatch: async (route, attempt) => {
       if (stream) {
         try {
-          await streamCompletion(res, route, messages, completionOptions, {
+          await streamCompletion(res, route, messages, dispatchOptions, {
             start, attempt, attemptLog, clientGone: () => clientGone, requestedModel, estimatedInputTokens, tools, pinnedModelId,
             sessionId, pinned: resolved.pinned,
           });
@@ -447,7 +542,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         }
       }
 
-      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, completionOptions);
+      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, dispatchOptions);
       const respMsg = result.choices?.[0]?.message;
       const respText = contentToString(respMsg?.content ?? '');
       let respToolCalls = respMsg?.tool_calls ?? [];
@@ -526,16 +621,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`);
     },
     onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
-      if (exhaustion) {
-        setFallbackHeaders(res, info.attempts.length, info.attempts);
-        sendError(res, exhaustion.status, anthropicErrorType(exhaustion), exhaustion.message);
-      } else {
-        sendError(res, routeErr?.status ?? 503, 'api_error', routeErr?.message ?? 'No model available to route this request');
-      }
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      sendExhaustion(res, exhaustion);
     },
     onExhausted: (exhaustion, info) => {
       setFallbackHeaders(res, info.attempts.length, info.attempts);
-      sendError(res, exhaustion.status, anthropicErrorType(exhaustion), exhaustion.message);
+      sendExhaustion(res, exhaustion);
     },
   });
 });
@@ -609,10 +700,28 @@ async function streamCompletion(
     messageStarted = true;
   };
 
+  // Reasoning output (delta.reasoning_content from providers / the <think>
+  // extractor, delta.reasoning from Ollama-style upstreams) is buffered and
+  // emitted as one complete thinking block right before the first text/tool
+  // block. Buffering (not live thinking_delta streaming) keeps the commit
+  // point where it was: a stream that produces ONLY reasoning and dies still
+  // fails over invisibly, exactly like the OpenAI surface's preamble hold.
+  let reasoningBuf = '';
+  const flushThinking = () => {
+    if (reasoningBuf.length === 0) return;
+    const idx = nextIndex++;
+    writeSse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '' } });
+    writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: reasoningBuf } });
+    writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+    outputChars += reasoningBuf.length;
+    reasoningBuf = '';
+  };
+
   // Commit (if needed), open the text block (if needed), and stream `text`.
   const emitText = (text: string) => {
     ensureMessageStart();
     if (!textBlockOpen) {
+      flushThinking(); // thinking block precedes the text block
       textBlockIndex = nextIndex++;
       writeSse(res, 'content_block_start', { type: 'content_block_start', index: textBlockIndex, content_block: { type: 'text', text: '' } });
       textBlockOpen = true;
@@ -656,6 +765,11 @@ async function streamCompletion(
           acc.thought_signature = thoughtSignature;
         }
       }
+
+      // Reasoning deltas: providers emit reasoning_content (or Ollama-style
+      // `reasoning`); the shared <think> extractor emits reasoning_content.
+      const reasoningDelta = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
+      if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) reasoningBuf += reasoningDelta;
 
       const text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
       if (text.length === 0) continue;
@@ -741,6 +855,9 @@ async function streamCompletion(
 
     ensureMessageStart();
     if (textBlockOpen) writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+    // Residual reasoning: tool-only turns (no text block ever opened) and
+    // reasoning that arrived after the text block was already streaming.
+    flushThinking();
 
     for (const call of completedCalls) {
       const idx = nextIndex++;
@@ -771,6 +888,12 @@ async function streamCompletion(
     logRequest(route.platform, route.modelId, route.keyId, 'success', ctx.estimatedInputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId);
   } catch (err: any) {
     if (err instanceof StreamAlreadyStarted) throw err;
+    // Client abort mid-stream: the pump's own `if (ctx.clientGone()) break`
+    // can lose the race against the fetch-signal rejection, so the abort may
+    // surface here instead. Rethrow — the shared loop's client-abort branch
+    // stops the ladder without benching or an error log row (the socket is
+    // gone; nothing to render).
+    if (isClientAbortError(err)) throw err;
     if (messageStarted) {
       // Real payload already reached the client — finish the SSE response
       // honestly instead of leaving Claude Code hanging, and stop the retry loop.
@@ -793,8 +916,14 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
     sendError(res, 400, 'invalid_request_error', 'Invalid request');
     return;
   }
-  const { messages } = convertRequest(parsed.data);
-  res.json({ input_tokens: estimateTokens(messages) });
+  const { messages, tools } = convertRequest(parsed.data);
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    recordStats: false,
+  });
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
+  res.json({ input_tokens: estimateTokens(compressionResult.messages) });
 });
 
 // Anthropic-compatible GET /v1/models. Content-negotiated: only answers when
@@ -804,21 +933,26 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
 // endpoint (real free models that can serve a request right now, plus "auto") —
 // no fake Claude cloud models.
 //
-// Heads-up: Claude Code's gateway model picker (enabled via
-// CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) only surfaces ids beginning
-// with `claude`/`anthropic`, so our ids won't populate its picker by design.
-// Routing still works because Claude Code keeps its built-in `claude-*` names,
-// which the model map sends to "auto" (or a pinned model).
+// Optional `claude/<real-id>` aliases let Claude Code's gateway picker discover
+// the full catalog; /messages strips the synthetic prefix before routing.
 anthropicRouter.get('/models', (req: Request, res: Response, next: NextFunction) => {
   if (!req.headers['anthropic-version']) return next(); // OpenAI client → proxyRouter
   if (!authenticate(req, res)) return;
 
   const { models } = buildModelListing();
+  const available = models.filter(m => m.available === 1);
+  const aliasesEnabled = getSetting('expose_cc_discovery_aliases') === '1';
   const data = [
     { type: 'model' as const, id: 'auto', display_name: 'Auto (router picks the best available model)', created_at: MODEL_CREATED_AT },
-    ...models
-      .filter(m => m.available === 1)
-      .map(m => ({ type: 'model' as const, id: m.id, display_name: m.name, created_at: MODEL_CREATED_AT })),
+    ...available.map(m => ({ type: 'model' as const, id: m.id, display_name: m.name, created_at: MODEL_CREATED_AT })),
+    ...(aliasesEnabled
+      ? available.map(m => ({
+        type: 'model' as const,
+        id: `claude/${m.id}`,
+        display_name: `${m.name} (Claude Code)`,
+        created_at: MODEL_CREATED_AT,
+      }))
+      : []),
   ];
   res.json({ data, has_more: false, first_id: data[0]?.id ?? null, last_id: data[data.length - 1]?.id ?? null });
 });

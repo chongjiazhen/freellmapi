@@ -38,6 +38,12 @@ export function isRetryableError(err: any): boolean {
     // provider in the fallback chain may have a larger limit. Same reasoning as 503.
     || msg.includes('413') || msg.includes('payload too large') || msg.includes('request body too large')
     || msg.includes('request entity too large') || msg.includes('content too large')
+    // Context/prompt-too-large in all its provider wordings (Anthropic "prompt
+    // is too long", Google "input token count ... exceeds", OpenAI "maximum
+    // context length", …): another candidate may have a larger window, so fail
+    // over; if EVERY candidate rejects it the exhaustion ladder renders an
+    // honest 413 instead of a generic failure.
+    || isContextTooLargeError(err)
     // 404: model deprecated/removed upstream (e.g. OpenRouter's "no endpoints found"
     // for a model that's been pulled). Rotate to the next model in the chain —
     // setCooldown + the health checker will avoid this model on subsequent requests.
@@ -87,7 +93,67 @@ export function isRetryableError(err: any): boolean {
     || msg.includes('in-band provider error')
     || msg.includes('stream ended unexpectedly')
     || msg.includes('stream stalled')
+    // First-byte timeout (#584): the grace budget expired before ANY byte
+    // reached the client, so the next candidate can serve it invisibly.
+    || msg.includes('no first byte')
     || msg.includes('unparseable inline tool-call dialect');
+}
+
+// A genuine provider QUOTA signal: a structured 429 or rate-limit/quota wording.
+// Distinct from the much broader isRetryableError: timeouts, 5xx, transport
+// failures and dead-turn classes are retryable but say nothing about quotas.
+// The null-limits exhaustion heuristic in getCooldownDecisionForLimit (services/
+// ratelimit.ts) keys off this: only an actual quota signal may feed its
+// "effectively daily-exhausted" escalation ladder. Before this split, a slow
+// local Ollama route timing out twice classified retryable → recorded as a
+// null-limit "429" → escalated 2m→10m→1h→24h and 429'd every request while the
+// server was merely busy generating (#592).
+// Mirrors the other classifiers: trust the structured status when the adapter
+// attached one (providerHttpError sets err.status everywhere); fall back to
+// message markers only when there is no status.
+export function isRateLimitSignal(err: any): boolean {
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status !== 0) return status === 429;
+  const msg = (err?.message ?? '').toLowerCase();
+  return msg.includes('429') || msg.includes('rate limit') || msg.includes('too many requests')
+    || msg.includes('quota') || msg.includes('resource_exhausted');
+}
+
+// ── Client-caused aborts ─────────────────────────────────────────────────────
+// When the gateway's OWN client hangs up, the proxy surfaces abort the composed
+// fetch signal with this marked error, and undici rejects the in-flight fetch /
+// body read / stream read with the same object (fetch propagates the signal's
+// abort reason). It is deliberately NOT an AbortError and its message contains
+// neither "aborted" nor "timeout": enrichAbort (lib/proxy.ts) must pass it
+// through untouched, and it must never classify as a retryable provider
+// timeout — a vanished client says nothing about provider health, so the
+// fallback loop stops without a cooldown, health penalty, or failure stats.
+export function newClientAbortError(): Error {
+  const err = new Error('client disconnected — upstream request canceled');
+  (err as Error & { clientAbort?: boolean }).clientAbort = true;
+  return err;
+}
+
+/** True when an error is (or wraps) the client-disconnect abort above. The
+ * structured marker is the primary signal; `cause` is checked because some
+ * transports re-wrap the abort reason, and the message substring is the last
+ * resort for errors that were stringified across a boundary. */
+export function isClientAbortError(err: any): boolean {
+  if (err?.clientAbort === true) return true;
+  if (err?.cause && (err.cause as { clientAbort?: boolean }).clientAbort === true) return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  return msg.includes('client disconnected');
+}
+
+/** True for any fetch-abort rejection surfacing out of a body read — the
+ * per-attempt timeout ('request'-bounds deadline in fetchWithTimeout), an
+ * AbortSignal.timeout, or the client disconnect above. Adapters that wrap
+ * res.json() in a diagnostic catch (openai-compat's non-JSON-body split) must
+ * rethrow these instead of classifying them as a malformed provider body. */
+export function isAbortLikeError(err: any): boolean {
+  if (isClientAbortError(err)) return true;
+  const name = (err as { name?: string })?.name;
+  return name === 'AbortError' || name === 'TimeoutError' || /\baborted\b/i.test(err?.message ?? '');
 }
 
 // A 401 / invalid-API-key error from a provider. KEY-fatal, not request-fatal:
@@ -161,6 +227,47 @@ export function isProviderBadRequestError(err: any): boolean {
   if (status === 422) return msg.includes('api error 422') || msg.includes('unprocessable entity');
   if (status !== 0) return false;
   return msg.includes('api error 400') || msg.includes('api error 422') || msg.includes('unprocessable entity');
+}
+
+// A "this request/prompt is too large" rejection. Providers word it very
+// differently and even disagree on the HTTP status:
+//   - OpenAI-compat: 400 with code `context_length_exceeded` — "This model's
+//     maximum context length is 8192 tokens. However, your messages resulted
+//     in 10001 tokens. Please reduce the length of the messages."
+//   - Anthropic: 400 invalid_request_error — "prompt is too long: 210000
+//     tokens > 200000 maximum" (Bedrock words it "Input is too long for
+//     requested model.")
+//   - Google/Gemini: 400 INVALID_ARGUMENT — "The input token count (1200000)
+//     exceeds the maximum number of tokens allowed (1048576)."
+//   - Groq: a literal HTTP 413 — "Request too large for model `x` ... on
+//     tokens per minute (TPM): Limit 30000, Requested 33476". Requested >
+//     Limit can never fit that candidate's window, so it belongs here (too
+//     large for the candidate), not with transient per-minute 429s.
+//   - Reverse proxies / gateways: 413 "Payload Too Large" / "request entity
+//     too large" / "content too large".
+// Structured status first (providerHttpError attaches err.status on every
+// adapter), then the code field, then message markers — mirroring how the
+// other classifiers in this file work. Retryable (a sibling candidate may have
+// a larger window), but when EVERY attempt dies this way the exhaustion ladder
+// renders an honest 413 instead of a generic failure.
+export function isContextTooLargeError(err: any): boolean {
+  if (err?.status === 413) return true;
+  if (typeof err?.code === 'string' && err.code.toLowerCase() === 'context_length_exceeded') return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  return msg.includes('context_length_exceeded')
+    || msg.includes('maximum context length')
+    || msg.includes('context length exceeded')
+    || /exceeds[^.]*context (length|window|size)/.test(msg)
+    || msg.includes('prompt is too long')
+    || msg.includes('input is too long')
+    || /input token count[^.]*exceeds/.test(msg)
+    || msg.includes('exceeds the maximum number of tokens')
+    || msg.includes('request too large')
+    || msg.includes('payload too large')
+    || msg.includes('request entity too large')
+    || msg.includes('request body too large')
+    || msg.includes('content too large')
+    || msg.includes('api error 413');
 }
 
 // A 402 Payment Required / out-of-credits error. Distinct from a transient 429:

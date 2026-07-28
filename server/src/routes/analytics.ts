@@ -293,6 +293,35 @@ analyticsRouter.get('/by-platform', (req: Request, res: Response) => {
   }));
 });
 
+analyticsRouter.get('/by-client', (req: Request, res: Response) => {
+  const range = (req.query.range as string) ?? '7d';
+  const since = getSinceTimestamp(range);
+  const rows = getDb().prepare(`
+    SELECT
+      COALESCE(client_agent, 'unknown') AS client_agent,
+      COUNT(*) AS requests,
+      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) * 100.0 / COUNT(*) AS success_rate,
+      AVG(latency_ms) AS avg_latency_ms,
+      SUM(input_tokens) AS total_input_tokens,
+      SUM(output_tokens) AS total_output_tokens,
+      MAX(strftime('%Y-%m-%dT%H:%M:%SZ', created_at)) AS last_seen_at
+    FROM requests
+    WHERE created_at >= ?
+    GROUP BY client_agent
+    ORDER BY requests DESC
+  `).all(since) as any[];
+
+  res.json(rows.map(row => ({
+    clientAgent: row.client_agent,
+    requests: row.requests,
+    successRate: Math.round((row.success_rate ?? 0) * 10) / 10,
+    avgLatencyMs: Math.round(row.avg_latency_ms ?? 0),
+    totalInputTokens: row.total_input_tokens ?? 0,
+    totalOutputTokens: row.total_output_tokens ?? 0,
+    lastSeenAt: row.last_seen_at,
+  })));
+});
+
 // Stats grouped by API key. Raw-row scoped (the hourly aggregate has no key
 // dimension), LEFT JOINed to api_keys so a request whose key was later deleted
 // still shows up with a null label — the keyId is always returned.
@@ -467,22 +496,46 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
   const since = getSinceTimestamp(range);
   const limit = Math.min(Math.max(parseInt(req.query.limit as string, 10) || 100, 1), 500);
   const offset = Math.max(parseInt(req.query.offset as string, 10) || 0, 0);
+
+  // Optional filters. Both are validated (whitelist / shape) and applied as
+  // bound parameters; absent filters keep the default behavior identical.
+  const status = req.query.status as string | undefined;
+  if (status !== undefined && status !== 'success' && status !== 'error') {
+    res.status(400).json({ error: "invalid status filter (expected 'success' or 'error')" });
+    return;
+  }
+  // Platform ids are short slugs ('groq', 'pt-custom_1'); anything else is a
+  // client bug, not a filter.
+  const platform = req.query.platform as string | undefined;
+  if (platform !== undefined && !/^[A-Za-z0-9_-]{1,64}$/.test(platform)) {
+    res.status(400).json({ error: 'invalid platform filter' });
+    return;
+  }
   const db = getDb();
 
+  const filterSql =
+    (status !== undefined ? ' AND status = ?' : '') +
+    (platform !== undefined ? ' AND platform = ?' : '');
+  const filterParams = [
+    ...(status !== undefined ? [status] : []),
+    ...(platform !== undefined ? [platform] : []),
+  ];
+
   const total = (db.prepare(
-    'SELECT COUNT(*) as c FROM requests WHERE created_at >= ?'
-  ).get(since) as { c: number }).c;
+    `SELECT COUNT(*) as c FROM requests WHERE created_at >= ?${filterSql}`
+  ).get(since, ...filterParams) as { c: number }).c;
 
   const rows = db.prepare(`
     SELECT id, platform, model_id, requested_model, request_type, status,
            input_tokens, output_tokens, latency_ms, error,
-           client_ip, client_user_agent,
-           strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at_iso
+           client_ip, client_user_agent, client_agent,
+           strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at_iso,
+           (SELECT COUNT(*) FROM request_attempts a WHERE a.request_id = requests.id) as attempt_count
     FROM requests
-    WHERE created_at >= ?
+    WHERE created_at >= ?${filterSql}
     ORDER BY created_at DESC, id DESC
     LIMIT ? OFFSET ?
-  `).all(since, limit, offset) as any[];
+  `).all(since, ...filterParams, limit, offset) as any[];
 
   res.json({
     total,
@@ -499,7 +552,80 @@ analyticsRouter.get('/requests', (req: Request, res: Response) => {
       error: r.error,
       clientIp: r.client_ip,
       clientUserAgent: r.client_user_agent,
+      clientAgent: r.client_agent,
       createdAt: r.created_at_iso,
+      // Failover-ladder length for this row. Attempts hang off the TERMINAL
+      // row of a proxied request; mid-ladder failure rows report 0.
+      attemptCount: r.attempt_count,
+    })),
+  });
+});
+
+// Per-request detail: the row plus its durable failover ladder — one entry per
+// dispatched attempt (including the successful final one), ordinal-ordered,
+// with the failure class and timing of each hop. keyOrdinal is the per-request
+// key ordinal (key1, key2…), same anonymization as X-Fallback-Trail — internal
+// key ids are never exposed. Attempts are keyed to the ladder's terminal row
+// (the success row, or the last failure row when it exhausted), so mid-ladder
+// error rows legitimately return an empty attempts array.
+analyticsRouter.get('/requests/:id', (req: Request, res: Response) => {
+  const id = Number.parseInt(req.params.id as string, 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ error: 'invalid request id' });
+    return;
+  }
+  const db = getDb();
+
+  const r = db.prepare(`
+    SELECT id, platform, model_id, requested_model, served_model, request_type, status,
+           input_tokens, output_tokens, latency_ms, ttfb_ms, error,
+           client_ip, client_user_agent, client_agent,
+           strftime('%Y-%m-%dT%H:%M:%SZ', created_at) as created_at_iso
+    FROM requests
+    WHERE id = ?
+  `).get(id) as any;
+  if (!r) {
+    res.status(404).json({ error: 'request not found' });
+    return;
+  }
+
+  const attempts = db.prepare(`
+    SELECT ordinal, platform, model_id, key_ordinal, outcome, start_offset_ms, duration_ms, error_summary
+    FROM request_attempts
+    WHERE request_id = ?
+    ORDER BY ordinal ASC
+  `).all(id) as any[];
+
+  res.json({
+    id: r.id,
+    platform: r.platform,
+    modelId: r.model_id,
+    requestedModel: r.requested_model,
+    // Upstream-reported model when it genuinely differed from the routed
+    // model_id (#534 served-model drift guard); null in the healthy case.
+    servedModel: r.served_model,
+    requestType: r.request_type,
+    status: r.status,
+    inputTokens: r.input_tokens,
+    outputTokens: r.output_tokens,
+    latencyMs: r.latency_ms,
+    ttfbMs: r.ttfb_ms,
+    error: r.error,
+    clientIp: r.client_ip,
+    clientUserAgent: r.client_user_agent,
+    clientAgent: r.client_agent,
+    createdAt: r.created_at_iso,
+    attempts: attempts.map(a => ({
+      ordinal: a.ordinal,
+      platform: a.platform,
+      modelId: a.model_id,
+      keyOrdinal: a.key_ordinal,
+      outcome: a.outcome,
+      startOffsetMs: a.start_offset_ms,
+      durationMs: a.duration_ms,
+      // Short, redacted per-hop error text (null for successful hops and for
+      // rows written before the error_summary migration).
+      errorSummary: a.error_summary ?? null,
     })),
   });
 });

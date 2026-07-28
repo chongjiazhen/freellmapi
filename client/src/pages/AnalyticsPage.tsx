@@ -4,13 +4,18 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, Legend,
 } from 'recharts'
+import { X } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Badge } from '@/components/ui/badge'
+import { Dialog, DialogClose, DialogPopup, DialogTitle } from '@/components/ui/dialog'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { PageHeader } from '@/components/page-header'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip as HoverTooltip } from '@/components/tooltip'
 import { formatSqliteUtcToLocalTime } from '@/lib/utils'
+import { platformColors } from '@/lib/routing'
 import { useI18n } from '@/i18n'
 
 type TimeRange = '24h' | '7d' | '30d' | '90d'
@@ -45,6 +50,16 @@ interface ByPlatformRow {
   avgTokensPerSecond: number | null
   totalInputTokens: number
   totalOutputTokens: number
+}
+
+interface ByClientRow {
+  clientAgent: string
+  requests: number
+  successRate: number
+  avgLatencyMs: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  lastSeenAt: string | null
 }
 
 interface TimelineBucket {
@@ -109,12 +124,34 @@ interface RecentCallRow {
   clientIp: string | null
   clientUserAgent: string | null
   createdAt: string
+  // Failover-ladder length: attempts hang off the TERMINAL row of a proxied
+  // request, so mid-ladder failure rows report 0.
+  attemptCount: number
 }
 
 interface RecentCallsResponse {
   total: number
   rows: RecentCallRow[]
 }
+
+// One hop of the failover ladder, from GET /api/analytics/requests/:id.
+interface RequestAttempt {
+  ordinal: number
+  platform: string
+  modelId: string
+  keyOrdinal: number
+  outcome: string
+  startOffsetMs: number
+  durationMs: number
+  errorSummary: string | null
+}
+
+interface RequestDetail extends Omit<RecentCallRow, 'attemptCount'> {
+  ttfbMs: number | null
+  attempts: RequestAttempt[]
+}
+
+type StatusFilter = 'all' | 'success' | 'error'
 
 // First product token of the UA ("python-requests/2.32.3", "curl/8.6.0", …)
 // is enough to tell callers apart in a narrow cell; full string on hover.
@@ -143,14 +180,160 @@ function Stat({ label, value, hint, className }: { label: string; value: string 
   return hint ? <HoverTooltip text={hint} side="bottom" className="block">{card}</HoverTooltip> : card
 }
 
-function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+function Panel({ title, actions, children }: { title: string; actions?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="rounded-3xl border bg-card">
-      <div className="px-4 py-3 border-b">
+      <div className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2">
         <h3 className="text-sm font-medium">{title}</h3>
+        {actions}
       </div>
       <div className="p-4">{children}</div>
     </div>
+  )
+}
+
+// Platform swatch shared by the ladder and the per-provider table; same color
+// source as the token-usage legend (lib/routing.ts), same gray fallback.
+function PlatformDot({ platform }: { platform: string }) {
+  return (
+    <span
+      className="size-2 rounded-full flex-shrink-0"
+      style={{ backgroundColor: platformColors[platform] ?? '#94a3b8' }}
+    />
+  )
+}
+
+// Compact ms rendering for ladder timings: sub-second stays in ms, longer
+// spans read as seconds ("38.8 s") like the issue reports do.
+function formatMs(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`
+  return `${ms} ms`
+}
+
+// Key/value line of the request-detail summary grid.
+function DetailField({ label, value, mono }: { label: string; value: React.ReactNode; mono?: boolean }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
+      <p className={`text-sm mt-0.5 break-words ${mono ? 'tabular-nums' : ''}`}>{value}</p>
+    </div>
+  )
+}
+
+// Per-request drill-down: the parent row's fields plus the failover ladder —
+// one entry per dispatched attempt (ordinal → provider/model → key ordinal →
+// outcome → timing, with the redacted per-hop error when one was recorded).
+// A dialog (the app's detail-popup idiom, cf. keys/export-keys-dialog) rather
+// than a routed page so the list's range/filter context stays put behind it.
+function RequestDetailDialog({ requestId, onClose }: { requestId: number | null; onClose: () => void }) {
+  const { t } = useI18n()
+
+  const { data: detail, isLoading } = useQuery({
+    queryKey: ['analytics', 'request-detail', requestId],
+    queryFn: () => apiFetch<RequestDetail>(`/api/analytics/requests/${requestId}`),
+    enabled: requestId != null,
+  })
+
+  return (
+    <Dialog open={requestId != null} onOpenChange={(open) => { if (!open) onClose() }}>
+      <DialogPopup maxWidth="max-w-2xl">
+        <div className="mb-4 flex items-center justify-between gap-4">
+          <DialogTitle>{t('analytics.requestDetailTitle', { id: requestId ?? '' })}</DialogTitle>
+          <DialogClose
+            aria-label={t('common.dismiss')}
+            className="-mr-1 rounded-lg p-1 text-muted-foreground/70 transition-colors outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
+          >
+            <X className="size-4" />
+          </DialogClose>
+        </div>
+
+        {isLoading || !detail ? (
+          <div className="space-y-3">
+            <Skeleton className="h-24 rounded-xl" />
+            <Skeleton className="h-32 rounded-xl" />
+          </div>
+        ) : (
+          <div className="space-y-5">
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-x-4 gap-y-3">
+              <DetailField
+                label={t('analytics.time')}
+                value={formatSqliteUtcToLocalTime(detail.createdAt, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                mono
+              />
+              <DetailField
+                label={t('common.status')}
+                value={
+                  <span className={detail.status === 'success' ? '' : 'text-destructive'}>{detail.status}</span>
+                }
+              />
+              <DetailField
+                label={t('common.provider')}
+                value={
+                  <span className="inline-flex items-center gap-1.5">
+                    <PlatformDot platform={detail.platform} />
+                    {detail.platform}
+                  </span>
+                }
+              />
+              <DetailField label={t('common.model')} value={detail.modelId} />
+              {detail.requestedModel && detail.requestedModel !== detail.modelId && (
+                <DetailField label={t('analytics.requestedModel')} value={detail.requestedModel} />
+              )}
+              <DetailField
+                label={`${t('analytics.inTokens')} / ${t('analytics.outTokens')}`}
+                value={`${formatTokens(detail.inputTokens)} / ${formatTokens(detail.outputTokens)}`}
+                mono
+              />
+              <DetailField label={t('analytics.latency')} value={formatMs(detail.latencyMs ?? 0)} mono />
+              <DetailField label={t('analytics.ttft')} value={detail.ttfbMs != null ? formatMs(detail.ttfbMs) : '—'} mono />
+              <DetailField label={t('analytics.clientIp')} value={detail.clientIp ?? '—'} mono />
+              <DetailField label={t('analytics.clientAgent')} value={detail.clientUserAgent ?? '—'} />
+            </div>
+
+            {detail.error && (
+              <div className="rounded-xl border border-destructive/30 bg-destructive/5 px-3 py-2">
+                <p className="text-[11px] text-destructive uppercase tracking-wider">{t('analytics.message')}</p>
+                <p className="text-xs text-destructive/90 mt-1 break-words">{detail.error}</p>
+              </div>
+            )}
+
+            <div>
+              <h4 className="text-sm font-medium">{t('analytics.failoverLadder')}</h4>
+              <p className="text-xs text-muted-foreground mt-0.5">{t('analytics.failoverLadderHint')}</p>
+              {detail.attempts.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-6">{t('analytics.noAttemptTrace')}</p>
+              ) : (
+                <ol className="mt-3 space-y-2">
+                  {detail.attempts.map((a) => (
+                    <li key={a.ordinal} className="rounded-xl border px-3 py-2">
+                      <div className="flex items-center gap-2 text-xs">
+                        <span className="w-6 text-muted-foreground tabular-nums">#{a.ordinal + 1}</span>
+                        <PlatformDot platform={a.platform} />
+                        <span className="font-medium">{a.platform}</span>
+                        <span className="text-muted-foreground truncate" title={a.modelId}>{a.modelId}</span>
+                        <Badge variant="outline">{t('analytics.keyOrdinal', { n: a.keyOrdinal })}</Badge>
+                        <Badge variant={a.outcome === 'ok' || a.outcome === 'committed' ? 'secondary' : 'destructive'}>
+                          {a.outcome}
+                        </Badge>
+                        <span
+                          className="ml-auto whitespace-nowrap text-muted-foreground tabular-nums"
+                          title={t('analytics.attemptTimingHint')}
+                        >
+                          +{formatMs(a.startOffsetMs)} · {formatMs(a.durationMs)}
+                        </span>
+                      </div>
+                      {a.errorSummary && (
+                        <p className="mt-1 pl-8 text-xs text-destructive/90 break-words">{a.errorSummary}</p>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+          </div>
+        )}
+      </DialogPopup>
+    </Dialog>
   )
 }
 
@@ -189,6 +372,11 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<ByPlatformRow[]>(`/api/analytics/by-platform?range=${range}`),
   })
 
+  const { data: byClient = [] } = useQuery({
+    queryKey: ['analytics', 'by-client', range],
+    queryFn: () => apiFetch<ByClientRow[]>(`/api/analytics/by-client?range=${range}`),
+  })
+
   const { data: timeline = [] } = useQuery({
     queryKey: ['analytics', 'timeline', range],
     queryFn: () => apiFetch<TimelineBucket[]>(`/api/analytics/timeline?range=${range}`),
@@ -214,9 +402,21 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<ErrorDistribution>(`/api/analytics/error-distribution?range=${range}`),
   })
 
+  // Recent-calls list filters (status/platform) + the row opened in the
+  // drill-down dialog. Filters ride the query key so react-query refetches
+  // (and caches) each combination on its own.
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
+  const [platformFilter, setPlatformFilter] = useState<string>('all')
+  const [detailId, setDetailId] = useState<number | null>(null)
+
   const { data: recentCalls } = useQuery({
-    queryKey: ['analytics', 'requests', range],
-    queryFn: () => apiFetch<RecentCallsResponse>(`/api/analytics/requests?range=${range}&limit=100`),
+    queryKey: ['analytics', 'requests', range, statusFilter, platformFilter],
+    queryFn: () => {
+      const params = new URLSearchParams({ range, limit: '100' })
+      if (statusFilter !== 'all') params.set('status', statusFilter)
+      if (platformFilter !== 'all') params.set('platform', platformFilter)
+      return apiFetch<RecentCallsResponse>(`/api/analytics/requests?${params}`)
+    },
   })
 
   // Savings card shows ONE stable monthly figure regardless of the selected
@@ -377,6 +577,22 @@ export default function AnalyticsPage() {
             )}
           </Panel>
 
+          <Panel title={t('analytics.requestsByAgent')}>
+            {byClient.length === 0 ? (
+              <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
+            ) : (
+              <ResponsiveContainer width="100%" height={240}>
+                <BarChart data={byClient} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
+                  <XAxis dataKey="clientAgent" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
+                  <Tooltip contentStyle={tooltipStyle} />
+                  <Bar dataKey="requests" name={t('analytics.requests')} fill={seriesB} radius={[3, 3, 0, 0]} maxBarSize={24} />
+                </BarChart>
+              </ResponsiveContainer>
+            )}
+          </Panel>
+
           {/* Latency by provider: grouped avg + p95, same unit (ms), one axis. */}
           <Panel title={t('analytics.avgLatencyByProvider')}>
             {byPlatform.length === 0 ? (
@@ -479,9 +695,45 @@ export default function AnalyticsPage() {
 
           {/* Recent calls: one line per proxied request with the caller's IP +
               user agent. All local clients share the unified key, so this is
-              the only view that answers "who is hitting the router". */}
+              the only view that answers "who is hitting the router". Rows open
+              the failover-ladder drill-down; the header hosts status/provider
+              filters (server-side, so total reflects the filtered set). */}
           <div className="lg:col-span-2">
-            <Panel title={t('analytics.recentCalls')}>
+            <Panel
+              title={t('analytics.recentCalls')}
+              actions={
+                <div className="flex flex-wrap items-center gap-2">
+                  <SegmentedControl
+                    value={statusFilter}
+                    onValueChange={setStatusFilter}
+                    options={[
+                      { value: 'all', label: t('analytics.filterAll') },
+                      { value: 'success', label: t('common.success') },
+                      { value: 'error', label: t('analytics.errors') },
+                    ]}
+                    ariaLabel={t('common.status')}
+                  />
+                  <Select value={platformFilter} onValueChange={(v) => setPlatformFilter(v ?? 'all')}>
+                    <SelectTrigger size="sm" aria-label={t('common.provider')}>
+                      <SelectValue>
+                        {(v: string) => (!v || v === 'all' ? t('analytics.allProviders') : v)}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">{t('analytics.allProviders')}</SelectItem>
+                      {byPlatform.map((p) => (
+                        <SelectItem key={p.platform} value={p.platform}>
+                          <span className="flex items-center gap-2">
+                            <PlatformDot platform={p.platform} />
+                            <span>{p.platform}</span>
+                          </span>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              }
+            >
               {!recentCalls?.rows?.length ? (
                 <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
               ) : (
@@ -495,6 +747,7 @@ export default function AnalyticsPage() {
                         <TableHead>{t('common.model')}</TableHead>
                         <TableHead>{t('common.provider')}</TableHead>
                         <TableHead>{t('common.status')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.attempts')}</TableHead>
                         <TableHead className="text-right">{t('analytics.inTokens')}</TableHead>
                         <TableHead className="text-right">{t('analytics.outTokens')}</TableHead>
                         <TableHead className="text-right pr-4">{t('analytics.latency')}</TableHead>
@@ -502,7 +755,11 @@ export default function AnalyticsPage() {
                     </TableHeader>
                     <TableBody>
                       {recentCalls.rows.map((r) => (
-                        <TableRow key={r.id}>
+                        <TableRow
+                          key={r.id}
+                          onClick={() => setDetailId(r.id)}
+                          className="cursor-pointer"
+                        >
                           <TableCell className="pl-4 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
                             {formatSqliteUtcToLocalTime(r.createdAt, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', second: '2-digit' })}
                           </TableCell>
@@ -518,9 +775,67 @@ export default function AnalyticsPage() {
                           <TableCell className={`text-xs ${r.status === 'success' ? 'text-muted-foreground' : 'text-destructive'}`} title={r.error ?? undefined}>
                             {r.status}
                           </TableCell>
+                          {/* >1 = the request burned failover hops; that is the
+                              row worth drilling into, so give it weight. */}
+                          <TableCell className={`text-right text-xs tabular-nums ${r.attemptCount > 1 ? 'font-medium' : 'text-muted-foreground'}`}>
+                            {r.attemptCount > 0 ? r.attemptCount : '—'}
+                          </TableCell>
                           <TableCell className="text-right text-xs tabular-nums">{formatTokens(r.inputTokens)}</TableCell>
                           <TableCell className="text-right text-xs tabular-nums">{formatTokens(r.outputTokens)}</TableCell>
                           <TableCell className="text-right text-xs tabular-nums pr-4">{r.latencyMs} ms</TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </div>
+              )}
+            </Panel>
+          </div>
+
+          {/* Per-provider breakdown: the tabular face of the by-platform data —
+              the charts above show volume/latency, this row surfaces the
+              success-rate and error-count numbers (#335). */}
+          <div className="lg:col-span-2">
+            <Panel title={t('analytics.providerBreakdown')}>
+              {byPlatform.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
+              ) : (
+                <div className="max-h-[360px] overflow-y-auto -mx-4">
+                  <Table>
+                    <TableHeader>
+                      <TableRow>
+                        <TableHead className="pl-4">{t('common.provider')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.requests')}</TableHead>
+                        <TableHead className="text-right">{t('common.success')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.errors')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.avgLatency')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.p95Latency')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.avgTtft')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.tokensPerSec')}</TableHead>
+                        <TableHead className="text-right">{t('analytics.inTokens')}</TableHead>
+                        <TableHead className="text-right pr-4">{t('analytics.outTokens')}</TableHead>
+                      </TableRow>
+                    </TableHeader>
+                    <TableBody>
+                      {byPlatform.map((p) => (
+                        <TableRow key={p.platform}>
+                          <TableCell className="pl-4 text-sm font-medium">
+                            <span className="flex items-center gap-2">
+                              <PlatformDot platform={p.platform} />
+                              {p.platform}
+                            </span>
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{p.requests}</TableCell>
+                          <TableCell className="text-right tabular-nums">{p.successRate}%</TableCell>
+                          <TableCell className={`text-right tabular-nums ${p.errorCount > 0 ? 'text-destructive' : ''}`}>
+                            {p.errorCount > 0 ? p.errorCount : '—'}
+                          </TableCell>
+                          <TableCell className="text-right tabular-nums">{p.avgLatencyMs} ms</TableCell>
+                          <TableCell className="text-right tabular-nums">{p.p95LatencyMs != null ? `${p.p95LatencyMs} ms` : '—'}</TableCell>
+                          <TableCell className="text-right tabular-nums">{p.avgTtfbMs != null ? `${p.avgTtfbMs} ms` : '—'}</TableCell>
+                          <TableCell className="text-right tabular-nums">{p.avgTokensPerSecond != null ? p.avgTokensPerSecond : '—'}</TableCell>
+                          <TableCell className="text-right tabular-nums">{formatTokens(p.totalInputTokens)}</TableCell>
+                          <TableCell className="text-right tabular-nums pr-4">{formatTokens(p.totalOutputTokens)}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>
@@ -610,6 +925,8 @@ export default function AnalyticsPage() {
           )}
         </div>
       </div>
+
+      <RequestDetailDialog requestId={detailId} onClose={() => setDetailId(null)} />
     </div>
   )
 }

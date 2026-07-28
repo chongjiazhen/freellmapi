@@ -5,6 +5,7 @@ import { startHealthChecker, checkAllKeys } from './services/health.js';
 import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, flushProxyCache } from './lib/proxy.js';
 import { startWakeDetect } from './lib/wake-detect.js';
 import { startCatalogSync } from './services/catalog-sync.js';
+import { startCooldownProbe } from './services/cooldown-probe.js';
 import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
@@ -13,6 +14,12 @@ import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
 import { userCount } from './services/auth.js';
 import { generateSetupCode } from './lib/setup-code.js';
 import { warnOnEnvDrift } from './lib/env-drift.js';
+import { installLogRedaction } from './lib/log-redaction.js';
+
+// Before any other statement runs, so no provider key can reach stdout — users
+// paste server output into bug reports. Module scope, not inside main(), so it
+// is active for the whole process lifetime including startup logging.
+installLogRedaction();
 
 async function main() {
   const config = loadConfig();
@@ -54,6 +61,7 @@ async function main() {
     console.log(`Proxy endpoint: http://${display}:${PORT}/v1/chat/completions`);
     startHealthChecker(scheduler);
     startCatalogSync(scheduler);
+    startCooldownProbe(scheduler);
     startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
 
     // Post-sleep recovery: while the host was suspended (laptop lid, VM

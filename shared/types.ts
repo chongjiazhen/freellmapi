@@ -170,6 +170,14 @@ export interface ApiKeyModel {
   family?: string | null;
 }
 
+/** An active rate-limit cooldown on one model for a key. A key can be healthy
+ *  and enabled yet still skipped by the router because of these. */
+export interface ApiKeyCooldown {
+  modelId: string;
+  expiresAtMs: number;
+  remainingMs: number;
+}
+
 export interface ApiKey {
   id: number;
   platform: Platform;
@@ -181,7 +189,9 @@ export interface ApiKey {
   keyless: boolean;
   createdAt: string;
   lastCheckedAt: string | null;
+  lastHealthError: string | null;
   models?: ApiKeyModel[];
+  cooldowns?: ApiKeyCooldown[];
 }
 
 export interface ApiKeyCreate {

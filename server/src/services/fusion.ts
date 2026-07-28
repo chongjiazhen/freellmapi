@@ -6,11 +6,12 @@ import {
 } from './router.js';
 import {
   recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
+  getCooldownDecisionForLimit,
   PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS,
 } from './ratelimit.js';
 import { logRequest } from '../lib/request-log.js';
 import {
-  isRetryableError, isPaymentRequiredError,
+  isRetryableError, isRateLimitSignal, isPaymentRequiredError,
   isModelNotFoundError, isModelAccessForbiddenError,
 } from '../lib/error-classify.js';
 import { contentToString } from '../lib/content.js';
@@ -257,19 +258,25 @@ async function runModelCall(
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(
-          route.platform, route.modelId, route.keyId,
-          isPaymentRequiredError(err)
-            ? PAYMENT_REQUIRED_COOLDOWN_MS
-            : isModelAccessForbiddenError(err)
-            ? MODEL_FORBIDDEN_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs),
-        );
+        // Provenance mirrors cooldownDecisionForError (lib/fallback-loop.ts):
+        // credit/tier benches are never probe-recovered, Retry-After-backed
+        // ones only when our heuristic outlasted the provider's own retry time.
+        const decision = isPaymentRequiredError(err)
+          ? { durationMs: PAYMENT_REQUIRED_COOLDOWN_MS, source: 'credit' as const }
+          : isModelAccessForbiddenError(err)
+          ? { durationMs: MODEL_FORBIDDEN_COOLDOWN_MS, source: 'tier' as const }
+          : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
+        setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
         recordRateLimitHit(route.modelDbId);
         continue;
       }
       // Non-retryable (auth, validation) — this slot/judge is done.
       break;
+    } finally {
+      // Panel slots run concurrently, so a leaked lease here would starve the
+      // rest of the panel of its own keys' concurrency budget. The route object
+      // stays usable as a data carrier after release.
+      route.release?.();
     }
   }
 
@@ -343,16 +350,19 @@ async function runJudgeStreaming(
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(
-          route.platform, route.modelId, route.keyId,
-          isPaymentRequiredError(err) ? PAYMENT_REQUIRED_COOLDOWN_MS
-            : isModelAccessForbiddenError(err) ? MODEL_FORBIDDEN_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs),
-        );
+        // Same provenance mapping as the non-stream path above.
+        const decision = isPaymentRequiredError(err)
+          ? { durationMs: PAYMENT_REQUIRED_COOLDOWN_MS, source: 'credit' as const }
+          : isModelAccessForbiddenError(err)
+          ? { durationMs: MODEL_FORBIDDEN_COOLDOWN_MS, source: 'tier' as const }
+          : getCooldownDecisionForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err.retryAfterMs, { quotaSignal: isRateLimitSignal(err) });
+        setCooldown(route.platform, route.modelId, route.keyId, decision.durationMs, decision.source);
         recordRateLimitHit(route.modelDbId);
         continue;
       }
       break;
+    } finally {
+      route.release?.();
     }
   }
   return { ok: false, error: lastError ?? 'no available key for judge' };

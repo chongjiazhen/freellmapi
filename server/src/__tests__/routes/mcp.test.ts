@@ -124,10 +124,10 @@ describe('MCP server (/mcp, stateless Streamable HTTP)', () => {
     expect(data.top_models.some((m: any) => m.model_id === 'test-model')).toBe(true);
   });
 
-  it('lists the six gateway tools with schemas', async () => {
+  it('lists the seven gateway tools with schemas', async () => {
     const { body } = await rpc({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     const names = body.result.tools.map((t: any) => t.name).sort();
-    expect(names).toEqual(['cache_stats', 'list_models', 'provider_health', 'routing_info', 'set_routing_strategy', 'usage_summary']);
+    expect(names).toEqual(['cache_stats', 'compression_stats', 'list_models', 'provider_health', 'routing_info', 'set_routing_strategy', 'usage_summary']);
     for (const tool of body.result.tools) {
       expect(tool.description.length).toBeGreaterThan(20);
       expect(tool.inputSchema.type).toBe('object');
@@ -168,8 +168,8 @@ describe('MCP server (/mcp, stateless Streamable HTTP)', () => {
     expect(body.result.content[0].text).toContain('strategy must be one of');
   });
 
-  it('usage_summary and provider_health and cache_stats answer on an empty install', async () => {
-    for (const name of ['usage_summary', 'provider_health', 'cache_stats']) {
+  it('usage, health, cache, and compression stats answer on an empty install', async () => {
+    for (const name of ['usage_summary', 'provider_health', 'cache_stats', 'compression_stats']) {
       const { body } = await rpc({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name } });
       expect(body.result.content[0].type).toBe('text');
       expect(body.result.isError).toBeUndefined();

@@ -5,7 +5,7 @@ import type {
   ChatCompletionChunk,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 
@@ -139,7 +139,9 @@ export class AIHordeProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(this.buildBody(messages, modelId, options)),
-    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS);
+      // 'request' bounds: the queued generation is one blocking body read, so
+      // the deadline must cover it too (a hung body used to stall forever).
+    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -197,11 +199,11 @@ export class AIHordeProvider extends BaseProvider {
    * confirmed 401/403 is treated as an invalid key. Transport errors propagate
    * to health.ts (marked status='error' without counting a failure).
    */
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/models`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${this.resolveBearer(apiKey)}` },
-    }, 30000);
+    }, 30000, { timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -209,6 +211,6 @@ export class AIHordeProvider extends BaseProvider {
       quotaPoolKey: quotaContext?.quotaPoolKey,
       endpoint: 'models',
     });
-    return res.status !== 401 && res.status !== 403;
+    return this.validationResult(res);
   }
 }

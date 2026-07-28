@@ -23,13 +23,16 @@ describe('reasoning-model chat timeouts', () => {
     ['agnes', 60_000],
     ['opencode', 60_000],
     ['ollama', 120_000], // pre-existing bump; keep it from regressing too
+    // NVIDIA NIM prefills 100k-token prompts for minutes before the first SSE
+    // byte; this value doubles as the streaming first-byte grace budget (#584).
+    ['nvidia', 180_000],
   ] as const)('%s is registered with a %dms chat timeout', (platform, ms) => {
     const provider = resolveProvider(platform);
     expect(provider).toBeDefined();
     expect((provider as unknown as { timeoutMs: number }).timeoutMs).toBe(ms);
   });
 
-  it('cloudflare chat aborts on a 60s timer, not the 15s default', async () => {
+  it('cloudflare GLM 4.7 Flash gets its live-verified 200s per-model timeout', async () => {
     const provider = new CloudflareProvider();
     const delays: number[] = [];
     const origSetTimeout = global.setTimeout;
@@ -54,7 +57,7 @@ describe('reasoning-model chat timeouts', () => {
       '@cf/zai-org/glm-4.7-flash',
     );
 
-    expect(delays).toContain(60_000);
+    expect(delays).toContain(200_000);
     expect(delays).not.toContain(15_000);
   });
 });

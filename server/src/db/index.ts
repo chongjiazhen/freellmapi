@@ -1,16 +1,18 @@
 import crypto from 'crypto';
-import BetterSqlite from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'url';
 import { runMigrationsSync } from './migrate/runner.js';
 import { initEncryptionKey, isEncryptionKeyInitialized } from '../lib/crypto.js';
+import { nodeSqliteFactory } from './node-sqlite.js';
 import type { Db, DbFactory } from './types.js';
 
 export type { Db, DbFactory } from './types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.resolve(__dirname, '../../data/freeapi.db');
+const runtimeRequire = createRequire(import.meta.url);
 
 let db: Db;
 
@@ -27,7 +29,20 @@ export function getDefaultDbPath(): string {
 
 /** Default factory: opens a better-sqlite3 connection at the given path. */
 function betterSqliteFactory(resolvedPath: string): Db {
-  return new BetterSqlite(resolvedPath) as unknown as Db;
+  let BetterSqlite: new (path: string) => unknown;
+  try {
+    BetterSqlite = runtimeRequire('better-sqlite3') as new (path: string) => unknown;
+  } catch (cause) {
+    throw new Error(
+      'better-sqlite3 is not installed. Reinstall dependencies, or use Node.js 22.13+ on Android/Termux.',
+      { cause },
+    );
+  }
+  return new BetterSqlite(resolvedPath) as Db;
+}
+
+export function defaultDbFactory(platform: NodeJS.Platform = process.platform): DbFactory {
+  return platform === 'android' ? nodeSqliteFactory : betterSqliteFactory;
 }
 
 export function connectDb(
@@ -43,7 +58,7 @@ export function connectDb(
   const resolvedPath = dbPath ?? getDefaultDbPath();
   const isMemory = resolvedPath === ':memory:';
   const ensureDir = opts?.ensureDir ?? true;
-  const factory = opts?.factory ?? betterSqliteFactory;
+  const factory = opts?.factory ?? defaultDbFactory();
 
   if (!isMemory && ensureDir) {
     const dataDir = path.dirname(resolvedPath);
@@ -55,9 +70,30 @@ export function connectDb(
   db = factory(resolvedPath);
   if (!isMemory) db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // The dashboard and the proxy hot path write concurrently; without a busy
+  // timeout the loser of a write race gets SQLITE_BUSY immediately and the
+  // request fails. Five seconds is far longer than any write here takes.
+  db.pragma('busy_timeout = 5000');
+
+  if (!isMemory) restrictDbFilePermissions(resolvedPath);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
+}
+
+/** Restrict the DB and its WAL sidecars to the owner. The file holds encrypted
+ *  provider keys plus the dashboard password hash, so it must not be readable by
+ *  other local users. Best-effort: filesystems without POSIX modes (Windows,
+ *  some mounts) throw, and that must not stop startup. */
+function restrictDbFilePermissions(resolvedPath: string): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const target = `${resolvedPath}${suffix}`;
+    try {
+      if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
+    } catch {
+      // Non-fatal: permissions are a hardening measure, not a correctness one.
+    }
+  }
 }
 
 export function initDb(

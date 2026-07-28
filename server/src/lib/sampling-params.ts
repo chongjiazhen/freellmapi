@@ -24,6 +24,13 @@
 import { z } from 'zod';
 import type { Platform } from '@freellmapi/shared/types.js';
 
+// OpenAI's request-side reasoning knob. Wire values as of the current OpenAI
+// API: 'minimal'|'low'|'medium'|'high', plus 'none' (gpt-5.1). Forwarded
+// verbatim to openai-compat platforms per the policy below; the Google
+// adapter maps it natively onto generationConfig.thinkingConfig.
+export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high'] as const;
+export type ReasoningEffort = typeof REASONING_EFFORTS[number];
+
 // Every field is `.nullable()` because real clients serialize their whole
 // request struct and send explicit nulls for unset knobs (#200); null is
 // treated as absent and never forwarded.
@@ -44,6 +51,14 @@ export const samplingParamSchemaFields = {
       strict: z.boolean().nullable().optional(),
       schema: z.record(z.string(), z.unknown()).optional(),
     }).passthrough().optional(),
+  }).passthrough().nullable().optional(),
+  reasoning_effort: z.enum(REASONING_EFFORTS).nullable().optional(),
+  // Object-form alias some clients send (OpenRouter-style chat clients, and
+  // the Responses API's native shape): `reasoning: { effort }`. Resolved into
+  // reasoning_effort by pickSamplingParams; the wrapper object itself is never
+  // forwarded. Extra keys (summary, max_tokens…) are tolerated and ignored.
+  reasoning: z.object({
+    effort: z.enum(REASONING_EFFORTS).nullable().optional(),
   }).passthrough().nullable().optional(),
   // OpenAI's newer alias for max_tokens; surfaces resolve it into max_tokens
   // themselves (it is not a forwarded param of its own).
@@ -70,17 +85,22 @@ export interface ExtendedSamplingOptions {
   logprobs?: boolean;
   top_logprobs?: number;
   response_format?: ResponseFormat;
+  reasoning_effort?: ReasoningEffort;
 }
 
 export const EXTENDED_SAMPLING_KEYS = [
   'top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty',
   'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
-  'response_format',
+  'response_format', 'reasoning_effort',
 ] as const;
 export type ExtendedSamplingKey = typeof EXTENDED_SAMPLING_KEYS[number];
 
 type ParsedSamplingBody = {
   [K in ExtendedSamplingKey]?: unknown;
+} & {
+  // Object-form reasoning alias (see samplingParamSchemaFields); resolved into
+  // reasoning_effort below, never forwarded as-is.
+  reasoning?: { effort?: unknown } | null;
 };
 
 /**
@@ -96,6 +116,14 @@ export function pickSamplingParams(body: ParsedSamplingBody): ExtendedSamplingOp
     if (value === undefined || value === null) continue;
     if (key === 'response_format' && (value as { type?: string }).type === 'text') continue;
     out[key] = value;
+  }
+  // Object-form fallback: `reasoning: { effort }` fills reasoning_effort only
+  // when the flat field wasn't sent (the explicit flat form wins on conflict).
+  if (out.reasoning_effort === undefined) {
+    const effort = body.reasoning?.effort;
+    if (typeof effort === 'string' && (REASONING_EFFORTS as readonly string[]).includes(effort)) {
+      out.reasoning_effort = effort;
+    }
   }
   return out as ExtendedSamplingOptions;
 }
@@ -124,9 +152,10 @@ export interface PlatformParamPolicy {
 // boundary since routes carry platform ids as plain strings.
 export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPolicy>> = {
   // Mistral's API is strict (422 on unknown body keys) and names its seed
-  // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents.
+  // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents, and
+  // no reasoning_effort (Magistral's reasoning has no request-side knob).
   mistral: {
-    drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+    drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'],
     rename: { seed: 'random_seed' },
   },
   // Groq documents logprobs / top_logprobs / logit_bias as unsupported and
@@ -136,14 +165,16 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
   // argument" for knobs outside the OpenAI set.
   github: { drop: ['top_k', 'min_p', 'repetition_penalty'] },
   // Gemini's generationConfig has no equivalents for these; the adapter
-  // translates the rest natively (topK, seed, penalties, responseSchema).
+  // translates the rest natively (topK, seed, penalties, responseSchema, and
+  // reasoning_effort → thinkingConfig — see toGeminiExtendedConfig).
   google: { drop: ['min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'] },
   // Cohere's OpenAI-compat endpoint covers seed/penalties/response_format;
-  // the rest have no mapping there.
-  cohere: { drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'] },
+  // the rest (incl. reasoning_effort — Cohere's own knob is a non-OpenAI
+  // `thinking` object) have no mapping there.
+  cohere: { drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'] },
   // Workers AI's OpenAI-compat endpoint parses a known subset; send only what
   // it understands.
-  cloudflare: { drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs'] },
+  cloudflare: { drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'] },
   // AI Horde builds its own payload format; none of the extended set maps.
   aihorde: { drop: [...EXTENDED_SAMPLING_KEYS] },
   // Kilo's anonymous gateway 400s ("Provider returned error") whenever

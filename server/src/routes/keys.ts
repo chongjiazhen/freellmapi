@@ -9,6 +9,7 @@ import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../lib/key-parser.js';
 import { assessProviderUrl } from '../lib/url-guard.js';
 import { ensureModelInProfiles } from '../services/profile-models.js';
+import { getActiveCooldownsForKeys, clearCooldownsForKey } from '../services/ratelimit.js';
 
 export const keysRouter = Router();
 
@@ -189,6 +190,10 @@ keysRouter.get('/', (_req: Request, res: Response) => {
     });
   }
 
+  // A cooling-down key reads as healthy and enabled while the router skips it,
+  // so surface the cooldowns that explain the idleness. (#P0-7)
+  const cooldownsByKeyId = getActiveCooldownsForKeys(rows.map(row => Number(row.id)));
+
   const keys = rows.map(row => {
     let maskedKey = '****';
     try {
@@ -197,6 +202,7 @@ keysRouter.get('/', (_req: Request, res: Response) => {
     } catch {
       maskedKey = '[decrypt failed]';
     }
+    const cooldowns = cooldownsByKeyId.get(Number(row.id)) ?? [];
     return {
       id: row.id,
       platform: row.platform,
@@ -208,11 +214,38 @@ keysRouter.get('/', (_req: Request, res: Response) => {
       keyless: resolveProvider(row.platform)?.keyless === true,
       createdAt: row.created_at,
       lastCheckedAt: row.last_checked_at,
+      lastHealthError: row.last_health_error ?? null,
       models: row.platform === 'custom' ? (modelsByKeyId.get(row.id) ?? []) : undefined,
+      cooldowns: cooldowns.map(c => ({
+        modelId: c.modelId,
+        expiresAtMs: c.expiresAtMs,
+        remainingMs: c.remainingMs,
+      })),
     };
   });
 
   res.json(keys);
+});
+
+// Clear every active cooldown for one key. An escalated cooldown can bench a key
+// for up to 24h from a single bad window; once the operator has fixed the cause
+// there is otherwise no way back short of restarting and waiting it out.
+keysRouter.delete('/:id/cooldowns', (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) {
+    res.status(400).json({ error: 'Invalid key id' });
+    return;
+  }
+
+  const db = getDb();
+  const exists = db.prepare('SELECT 1 FROM api_keys WHERE id = ?').get(id);
+  if (!exists) {
+    res.status(404).json({ error: 'Key not found' });
+    return;
+  }
+
+  const cleared = clearCooldownsForKey(id);
+  res.json({ cleared });
 });
 
 // Export keys — returns plaintext keys in the requested format.
@@ -507,9 +540,9 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
         INSERT INTO models
           (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
            rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
-           supports_tools, supports_vision)
+           supports_tools, supports_vision, source)
         VALUES ('custom', @modelId, @displayName, 50, 50, 'Custom', NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
-           COALESCE(@tools, 1), COALESCE(@vision, 0))
+           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user')
         ON CONFLICT(platform, model_id)
         DO UPDATE SET
           display_name = excluded.display_name,

@@ -52,6 +52,7 @@ type ModelRow = {
   platform: string;
   model_id: string;
   key_id: number | null;
+  source: string;
 };
 
 function dbValue(key: keyof typeof MODEL_FIELD_COLUMNS, value: unknown): unknown {
@@ -61,7 +62,7 @@ function dbValue(key: keyof typeof MODEL_FIELD_COLUMNS, value: unknown): unknown
 
 function fetchModelRow(id: number): ModelRow | undefined {
   return getDb()
-    .prepare('SELECT id, platform, model_id, key_id FROM models WHERE id = ?')
+    .prepare('SELECT id, platform, model_id, key_id, source FROM models WHERE id = ?')
     .get(id) as ModelRow | undefined;
 }
 
@@ -240,7 +241,11 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     supportsTools: m.supports_tools === 1,
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
-    source: m.platform === 'custom' || m.key_id != null ? 'custom' : 'catalog',
+    // Real provenance from models.source ('catalog' | 'user'). The dashboard's
+    // existing vocabulary for user-added rows is 'custom', so map 1:1 here —
+    // this now also flags user models on native platforms (declarative
+    // config / admin adds), which the old platform/key_id heuristic missed.
+    source: m.source === 'user' ? 'custom' : 'catalog',
     keyId: m.key_id ?? null,
     keyLabel: m.key_label ?? null,
     hasOverrides: Boolean(m.has_overrides),

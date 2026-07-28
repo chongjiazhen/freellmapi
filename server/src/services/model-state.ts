@@ -61,7 +61,11 @@ function cleanPatch(patch: ModelOverridePatch): StoredOverrides {
   return cleaned;
 }
 
-export function isCatalogManagedModel(row: { platform: string; key_id?: number | null }): boolean {
+export function isCatalogManagedModel(row: { platform: string; key_id?: number | null; source?: string }): boolean {
+  // `source` is the authoritative provenance (models.source, 'catalog'|'user');
+  // callers that select it get an exact answer. The platform/key_id fallback
+  // covers callers that don't have the column in hand.
+  if (row.source === 'user') return false;
   return row.platform !== 'custom' && row.key_id == null;
 }
 
@@ -169,7 +173,7 @@ export function deleteTombstonedCatalogModels(db: Db): number {
       FROM models m
       JOIN catalog_model_tombstones t
         ON t.kind = 'chat' AND t.platform = m.platform AND t.model_id = m.model_id
-     WHERE m.platform != 'custom' AND m.key_id IS NULL
+     WHERE m.platform != 'custom' AND m.key_id IS NULL AND m.source != 'user'
   `).all() as { id: number; platform: string; model_id: string }[];
   const mediaRows = db.prepare(`
     SELECT mm.id

@@ -143,7 +143,7 @@ async function resolveDispatcher(): Promise<{ dispatcher: unknown; isSocks: bool
  * written to `requests.request_type` so the abort message and the row
  * column agree on terminology.
  */
-export type ProxyRequestType = 'chat' | 'embedding' | 'image' | 'audio' | 'unknown';
+export type ProxyRequestType = 'chat' | 'embedding' | 'image' | 'audio' | 'transcription' | 'unknown';
 
 /**
  * Build an AbortError DOMException whose `message` carries a compact triage
@@ -237,6 +237,17 @@ function socksFetch(
   const signal = init?.signal;
   const startedAt = Date.now();
 
+  // What to reject with when the signal fires. A client-caused abort carries
+  // its own marked reason (newClientAbortError in lib/error-classify.ts) —
+  // preserve it so the failure isn't misclassified downstream as a provider
+  // timeout; a plain timer abort keeps the tagged AbortError.
+  const abortRejection = (): Error => {
+    const reason = signal?.reason;
+    return reason instanceof Error && reason.name !== 'AbortError' && reason.name !== 'TimeoutError'
+      ? reason
+      : abortError(platform, type, timeoutMs, Date.now() - startedAt);
+  };
+
   return new Promise((resolve, reject) => {
     const req = transport.request({
       hostname: url.hostname,
@@ -251,7 +262,7 @@ function socksFetch(
     }, (res) => {
       if (signal?.aborted) {
         res.destroy();
-        reject(abortError(platform, type, timeoutMs, Date.now() - startedAt));
+        reject(abortRejection());
         return;
       }
 
@@ -286,12 +297,12 @@ function socksFetch(
     if (signal) {
       if (signal.aborted) {
         req.destroy();
-        reject(abortError(platform, type, timeoutMs, Date.now() - startedAt));
+        reject(abortRejection());
         return;
       }
       signal.addEventListener('abort', () => {
         req.destroy();
-        reject(abortError(platform, type, timeoutMs, Date.now() - startedAt));
+        reject(abortRejection());
       }, { once: true });
     }
 

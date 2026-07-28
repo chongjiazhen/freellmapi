@@ -5,12 +5,14 @@ import type {
   ChatToolCall,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { extendedBodyParams } from '../lib/sampling-params.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
+import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { isAbortLikeError } from '../lib/error-classify.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -108,6 +110,23 @@ export class OpenAICompatProvider extends BaseProvider {
     return this.keyless ? {} : { 'Authorization': `Bearer ${apiKey}` };
   }
 
+  /** Requesty's Leanstral route rejects greedy sampling when temperature=0.
+   * Omitting that value and supplying a neutral top_p keeps the caller's intent
+   * deterministic enough while using the provider's supported sampling path. */
+  private samplingForModel(modelId: string, options?: CompletionOptions): {
+    temperature: number | undefined;
+    topP: number | undefined;
+  } {
+    if (
+      this.platform === 'requesty' &&
+      modelId === 'mistral/leanstral-1-5' &&
+      options?.temperature === 0
+    ) {
+      return { temperature: undefined, topP: options.top_p ?? 1 };
+    }
+    return { temperature: options?.temperature, topP: options?.top_p };
+  }
+
   /** Mistral's OpenAI-compatible endpoint is strict about unknown nested fields
    * and returns 422 for provider-private replay fields that other gateways
    * ignore. Keep the OpenAI wire shape, but strip our internal reasoning /
@@ -156,6 +175,7 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
+    const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -166,16 +186,18 @@ export class OpenAICompatProvider extends BaseProvider {
       body: JSON.stringify({
         model: modelId,
         messages: this.messagesForPlatform(messages),
-        temperature: options?.temperature,
+        temperature: sampling.temperature,
         max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
+        top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
       }),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -210,6 +232,10 @@ export class OpenAICompatProvider extends BaseProvider {
     try {
       data = await res.json() as ChatCompletionResponse;
     } catch (err) {
+      // An aborted body read (per-attempt deadline, client disconnect) is not
+      // a malformed body — rethrow so it keeps its abort classification
+      // instead of reading as a "non-OpenAI-compatible endpoint" below.
+      if (isAbortLikeError(err)) throw err;
       parseErr = err;
       data = undefined as unknown as ChatCompletionResponse;
     }
@@ -268,6 +294,7 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
+    const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -278,9 +305,9 @@ export class OpenAICompatProvider extends BaseProvider {
       body: JSON.stringify({
         model: modelId,
         messages: this.messagesForPlatform(messages),
-        temperature: options?.temperature,
+        temperature: sampling.temperature,
         max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
+        top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
         tool_choice: options?.tool_choice,
@@ -288,7 +315,9 @@ export class OpenAICompatProvider extends BaseProvider {
         ...extendedBodyParams(this.platform, options),
         stream: true,
       }),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -313,10 +342,13 @@ export class OpenAICompatProvider extends BaseProvider {
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`);
     }
 
-    yield* this.readSseStream(res);
+    // First-byte grace (#584): the same chat timeout that bounded the headers
+    // also budgets the first stream read — NIM-style providers send SSE
+    // headers instantly, then prefill long prompts for minutes.
+    yield* this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs });
   }
 
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
     // health.ts catches them and marks status='error' WITHOUT incrementing
     // the consecutive-failure counter — only confirmed 401/403 disables a key.
@@ -332,7 +364,9 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.authHeader(apiKey),
         ...this.extraHeaders,
       },
-    }, 30000);
+      // 'request' bounds: a catalog body that hangs mid-transfer must not
+      // stall the health cycle past the deadline.
+    }, 30000, { timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -340,7 +374,7 @@ export class OpenAICompatProvider extends BaseProvider {
       quotaPoolKey: quotaContext?.quotaPoolKey,
       endpoint: 'models',
     });
-    return res.status !== 401 && res.status !== 403;
+    return this.validationResult(res);
   }
 }
 
@@ -366,6 +400,12 @@ function normalizeChoices(data: ChatCompletionResponse): void {
         .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
         .join('');
     }
+    // Inline `<think>…</think>` extraction (DeepSeek-style) BEFORE the fold
+    // below: a leading think block moves out of content into
+    // reasoning_content. Runs before the fold so a think-only message (no
+    // answer after the block) still folds back into content and is never
+    // returned as an empty assistant message.
+    extractThinkFromMessage(msg);
     // Fold reasoning into content if content is empty AND there are no
     // tool_calls. With tool_calls present, content=null is the correct OpenAI
     // shape; folding reasoning would confuse clients that branch on content.
