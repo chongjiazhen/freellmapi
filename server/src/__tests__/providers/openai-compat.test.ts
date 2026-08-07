@@ -502,6 +502,9 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
     { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
+    // pollinations registers a PollinationsProvider subclass (custom
+    // validateKey, see providers/pollinations.test.ts) but chat routing is
+    // stock openai-compat.
     { platform: 'pollinations', name: 'Pollinations', baseUrl: 'https://gen.pollinations.ai/v1' },
     { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
     { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
@@ -510,6 +513,9 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'navy',       name: 'NavyAI',        baseUrl: 'https://api.navy/v1' },
     { platform: 'nara',       name: 'NaraRouter',    baseUrl: 'https://router.bynara.id/v1' },
     { platform: 'sealion',    name: 'SEA-LION',      baseUrl: 'https://api.sea-lion.ai/v1' },
+    // modelscope registers a ModelScopeProvider subclass (custom validateKey,
+    // see providers/modelscope.test.ts) but chat routing is stock openai-compat.
+    { platform: 'modelscope', name: 'ModelScope',    baseUrl: 'https://api-inference.modelscope.cn/v1' },
   ] as const;
 
   for (const p of platforms) {
@@ -693,5 +699,147 @@ describe('extended sampling param passthrough', () => {
     expect(raw).not.toContain('seed');
     expect(raw).not.toContain('response_format');
     expect(raw).not.toContain('logit_bias');
+  });
+});
+
+describe('reasoning: request knob + <think> extraction (P2 #16)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const mockOk = (content: string, extra: Record<string, unknown> = {}) => ({
+    ok: true,
+    json: () => Promise.resolve({
+      id: 'x', object: 'chat.completion', created: 1, model: 'm',
+      choices: [{ index: 0, message: { role: 'assistant', content, ...extra }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  }) as any;
+
+  function sse(frames: string[]): any {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const f of frames) controller.enqueue(encoder.encode(f));
+        controller.close();
+      },
+    });
+    return { ok: true, body: stream, headers: new Headers() };
+  }
+
+  async function collect<T>(g: AsyncGenerator<T>): Promise<T[]> {
+    const out: T[] = [];
+    for await (const c of g) out.push(c);
+    return out;
+  }
+
+  const dataFrame = (delta: Record<string, unknown>, finish: string | null = null) =>
+    `data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', created: 1, model: 'm', choices: [{ index: 0, delta, finish_reason: finish }] })}\n\n`;
+
+  it('forwards reasoning_effort on the wire for a supporting platform', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'low' });
+    expect(body.reasoning_effort).toBe('low');
+  });
+
+  it('strips reasoning_effort for a platform whose policy drops it (mistral)', async () => {
+    let body: any = null;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      body = JSON.parse((init as any).body);
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'mistral', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { reasoning_effort: 'high' });
+    expect(body).not.toHaveProperty('reasoning_effort');
+  });
+
+  it('sends nothing reasoning-related when the knob is absent (default unchanged)', async () => {
+    let raw = '';
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      raw = (init as any).body;
+      return mockOk('hi');
+    });
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm', { temperature: 0 });
+    expect(raw).not.toContain('reasoning');
+  });
+
+  it('non-streaming: a leading <think> block moves into reasoning_content', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>chain of thought</think>The answer is 4.'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: '2+2?' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('The answer is 4.');
+    expect(msg.reasoning_content).toBe('chain of thought');
+  });
+
+  it('non-streaming: a think-only message still folds back into content (never empty)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('<think>all reasoning, no answer</think>'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('all reasoning, no answer');
+    expect(msg.reasoning_content).toBe('all reasoning, no answer');
+  });
+
+  it('non-streaming: tag-free content is untouched', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => mockOk('plain answer'));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const res = await p.chatCompletion('k', [{ role: 'user', content: 'q' }], 'm');
+    const msg = res.choices[0].message as any;
+    expect(msg.content).toBe('plain answer');
+    expect(msg.reasoning_content).toBeUndefined();
+  });
+
+  it('streaming: think content becomes delta.reasoning_content even when the tags split across chunks', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: '<thi' }),
+      dataFrame({ content: 'nk>step one, ' }),
+      dataFrame({ content: 'step two</th' }),
+      dataFrame({ content: 'ink>Final answer' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('step one, step two');
+    expect(content).toBe('Final answer');
+  });
+
+  it('streaming: an unclosed <think> at stream end flushes as reasoning, losing no text', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ content: '<think>truncated thought</thi' }),
+      dataFrame({}, 'length'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    const reasoning = chunks.map(c => (c.choices?.[0]?.delta as any)?.reasoning_content ?? '').join('');
+    const content = chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('');
+    expect(reasoning).toBe('truncated thought</thi');
+    expect(content).toBe('');
+  });
+
+  it('streaming: a tag-free stream is byte-identical (no synthetic frames, no reasoning)', async () => {
+    vi.spyOn(global, 'fetch').mockImplementation(async () => sse([
+      dataFrame({ role: 'assistant' }),
+      dataFrame({ content: 'Hello ' }),
+      dataFrame({ content: 'world' }),
+      dataFrame({}, 'stop'),
+      'data: [DONE]\n\n',
+    ]));
+    const p = new OpenAICompatProvider({ platform: 'groq', name: 'T', baseUrl: 'https://x/v1' });
+    const chunks = await collect(p.streamChatCompletion('k', [{ role: 'user', content: 'q' }], 'm'));
+    expect(chunks).toHaveLength(4);
+    expect(chunks.map(c => c.choices?.[0]?.delta?.content ?? '').join('')).toBe('Hello world');
+    expect(chunks.some(c => (c.choices?.[0]?.delta as any)?.reasoning_content != null)).toBe(false);
   });
 });

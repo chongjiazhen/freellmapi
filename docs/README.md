@@ -1,34 +1,24 @@
+**English** · [简体中文](i18n/zh-CN/docs/README.md)
+
 # FreeLLMAPI documentation
 
-This index points to the focused guides in the repository. The root [README](../README.md) remains the product overview and complete API reference.
+The root [README](../README.md) is the product overview; the detailed guides live here.
 
-## Install and deploy
+## Guides
 
-- [Quick start](../README.md#quick-start) — Docker one-liner, manual Docker Compose, and local development.
+- **[Install & deploy](install.md)** — quick start, Docker Compose, local development, declarative startup config, the Docker image, backups, the desktop app, and where your data lives.
+- **[API reference](api.md)** — chat completions, `auto:*` routing strategies, streaming, tool calling, vision, Gemini Google Search grounding, embeddings, response headers, and the Anthropic Messages surface.
+- **[Clients & coding agents](clients.md)** — OpenAI-compatible clients, recipes for Claude Code / Codex CLI / Cline / Continue / Aider / opencode / Cursor, the MCP server, editor autocomplete, and Context Handoff.
+- **[Prompt compression](compression.md)** — request-side modes, safeguards, per-request controls, custom tool-output filters, statistics, and preview APIs.
+- **[Architecture & internals](architecture.md)** — how the router works, routing and operational details, what's not supported, honest limitations, and the provider Terms-of-Service review.
+
+## More
+
+- [Android with Termux](install/android-termux.md) — experimental local installation using Node's built-in SQLite driver.
 - [Docker deployment](../docker/README.md) — container configuration and persistent storage.
 - [Desktop app](../desktop/README.md) — build and package the Electron application.
-- [Android with Termux](install/android-termux.md) — experimental local installation using Node's built-in SQLite driver.
-
-## Configure and operate
-
-- [Declarative startup configuration](../README.md#declarative-startup-config) — configure keys and custom providers from environment variables.
-- [Credentials and local data](../README.md#credentials-and-where-your-data-lives) — desktop paths and credential storage.
-- [Premium live catalog](../README.md#premium-live-catalog) — catalog update behavior and licensing.
-- [Database migrations](../server/src/db/README.md) — create, apply, inspect, and roll back schema migrations.
-
-## Integrate clients
-
-- [OpenAI-compatible clients](../README.md#works-with-openai-compatible-clients) — SDK and tool configuration.
-- [Coding agents](../README.md#coding-agents) — Codex CLI, Claude Code, OpenCode, and MCP clients.
-- [Using the API](../README.md#using-the-api) — request examples for chat, streaming, tools, images, and audio.
-- [Embeddings](../README.md#embeddings) — embedding-model routing and custom endpoints.
-- [Anthropic and Claude clients](../README.md#anthropic--claude-clients) — Messages API compatibility.
-
-## Develop and contribute
-
 - [Contributor guide](../CONTRIBUTING.md) — development loop, testing expectations, and contribution policy.
-- [How the router works](../README.md#how-it-works) — architecture and fallback behavior.
-- [Database migration guide](../server/src/db/README.md) — migration CLI and conventions.
+- [Database migrations](../server/src/db/README.md) — create, apply, inspect, and roll back schema migrations.
 
 ## Website assets in this directory
 

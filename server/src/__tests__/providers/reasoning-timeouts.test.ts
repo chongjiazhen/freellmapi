@@ -23,6 +23,9 @@ describe('reasoning-model chat timeouts', () => {
     ['agnes', 60_000],
     ['opencode', 60_000],
     ['ollama', 120_000], // pre-existing bump; keep it from regressing too
+    // NVIDIA NIM prefills 100k-token prompts for minutes before the first SSE
+    // byte; this value doubles as the streaming first-byte grace budget (#584).
+    ['nvidia', 180_000],
   ] as const)('%s is registered with a %dms chat timeout', (platform, ms) => {
     const provider = resolveProvider(platform);
     expect(provider).toBeDefined();

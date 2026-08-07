@@ -139,7 +139,9 @@ export class AIHordeProvider extends BaseProvider {
         'Content-Type': 'application/json',
       },
       body: JSON.stringify(this.buildBody(messages, modelId, options)),
-    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS);
+      // 'request' bounds: the queued generation is one blocking body read, so
+      // the deadline must cover it too (a hung body used to stall forever).
+    }, options?.timeoutMs ?? HORDE_TIMEOUT_MS, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -201,7 +203,7 @@ export class AIHordeProvider extends BaseProvider {
     const res = await this.fetchWithTimeout(`${this.baseUrl}/models`, {
       method: 'GET',
       headers: { 'Authorization': `Bearer ${this.resolveBearer(apiKey)}` },
-    }, 30000);
+    }, 30000, { timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,

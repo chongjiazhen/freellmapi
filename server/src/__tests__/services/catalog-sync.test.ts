@@ -331,8 +331,14 @@ describe('reapplyCachedCatalog', () => {
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
     ).toBeUndefined();
 
-    // Simulate a restart: migrations re-insert the baseline model.
-    getDb().exec('DROP TABLE migrations');
+    // Simulate a restart: re-run the baseline migrations so their
+    // INSERT OR IGNORE re-adds the catalog-deleted model. The source-provenance
+    // migration (20260726_000003) must stay recorded as applied — in the real
+    // timeline its backfill runs exactly once (every install with an applied
+    // catalog cache already has a migrations table), and re-running it here
+    // would re-classify the baseline's re-inserted rows against the applied
+    // catalog instead of leaving them catalog-owned.
+    getDb().prepare("DELETE FROM migrations WHERE filename NOT LIKE '20260726_000003%'").run();
     runMigrationsSync(getDb(), 'up');
     expect(
       getDb().prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?').get(victim.platform, victim.modelId),
@@ -364,6 +370,187 @@ describe('reapplyCachedCatalog', () => {
     const catalog = catalogOf(existingAsCatalogModels());
     catalog.version = '2000.01.01';
     expect(catalog.version < MIN_CATALOG_VERSION).toBe(true);
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+// The speech-to-text registry rides the catalog's dedicated optional
+// `transcriptionModels` key (NOT the `models` array — old binaries would
+// ingest unknown-modality models entries as chat models) and lands in
+// media_models with modality='transcription'. These tests lock the sync,
+// prune scoping, enabled-merge, tombstone, and rejection rules.
+describe('applyCatalog: transcriptionModels', () => {
+  type CatalogTranscription = NonNullable<AnyCatalog['transcriptionModels']>[number];
+
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  function sttRoster(): CatalogTranscription[] {
+    return [
+      { platform: 'groq', modelId: 'whisper-large-v3-turbo', displayName: 'Whisper Large v3 Turbo (Groq)', priority: 0, enabled: true, maxBytes: 26214400 },
+      { platform: 'groq', modelId: 'whisper-large-v3', displayName: 'Whisper Large v3 (Groq)', priority: 1, enabled: true, maxBytes: 26214400 },
+      { platform: 'cloudflare', modelId: '@cf/openai/whisper-large-v3-turbo', displayName: 'Whisper Large v3 Turbo (Cloudflare Workers AI)', priority: 2, enabled: true, subtitleFormats: ['vtt'], requestStyle: 'json' },
+      { platform: 'cloudflare', modelId: '@cf/openai/whisper', displayName: 'Whisper (Cloudflare Workers AI)', priority: 3, enabled: true, subtitleFormats: ['vtt'], requestStyle: 'binary' },
+    ];
+  }
+
+  /** Catalog with an image media model plus (optionally) a STT snapshot. */
+  function sttCatalog(entries?: CatalogTranscription[]): AnyCatalog {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({
+      platform: 'cloudflare',
+      modelId: '@cf/test/image-model',
+      displayName: 'Test Image Model',
+      modality: 'image',
+    }));
+    const catalog = catalogOf(models);
+    if (entries) catalog.transcriptionModels = entries;
+    return catalog;
+  }
+
+  function sttRows(): Array<{ platform: string; model_id: string; enabled: number; priority: number; meta_json: string | null }> {
+    return getDb().prepare(`
+      SELECT platform, model_id, enabled, priority, meta_json
+        FROM media_models
+       WHERE modality = 'transcription'
+       ORDER BY priority, id
+    `).all() as any;
+  }
+
+  it('routes entries into media_models with modality, meta_json, and priority order', () => {
+    const counts = applyCatalog(getDb(), sttCatalog(sttRoster()));
+    expect(counts.inserted).toBeGreaterThanOrEqual(5); // 4 STT + the image row
+
+    const rows = sttRows();
+    expect(rows.map(r => `${r.platform}:${r.model_id}`)).toEqual([
+      'groq:whisper-large-v3-turbo',
+      'groq:whisper-large-v3',
+      'cloudflare:@cf/openai/whisper-large-v3-turbo',
+      'cloudflare:@cf/openai/whisper',
+    ]);
+    expect(JSON.parse(rows[0].meta_json!)).toEqual({ maxBytes: 26214400 });
+    expect(JSON.parse(rows[2].meta_json!)).toEqual({ subtitleFormats: ['vtt'], requestStyle: 'json' });
+    expect(JSON.parse(rows[3].meta_json!)).toEqual({ subtitleFormats: ['vtt'], requestStyle: 'binary' });
+
+    // The image row landed alongside, in its own modality.
+    const image = getDb().prepare(
+      "SELECT modality FROM media_models WHERE platform = 'cloudflare' AND model_id = '@cf/test/image-model'",
+    ).get() as { modality: string };
+    expect(image.modality).toBe('image');
+  });
+
+  it('enabled merge: local disable survives a catalog enable; catalog disable forces off', () => {
+    getDb().prepare(
+      "UPDATE media_models SET enabled = 0 WHERE modality = 'transcription' AND model_id = 'whisper-large-v3'",
+    ).run();
+    applyCatalog(getDb(), sttCatalog(sttRoster())); // catalog still says enabled
+    expect(sttRows().find(r => r.model_id === 'whisper-large-v3')!.enabled).toBe(0);
+
+    getDb().prepare(
+      "UPDATE media_models SET enabled = 1 WHERE modality = 'transcription' AND model_id = 'whisper-large-v3'",
+    ).run();
+    const roster = sttRoster();
+    roster.find(m => m.modelId === 'whisper-large-v3')!.enabled = false;
+    applyCatalog(getDb(), sttCatalog(roster));
+    expect(sttRows().find(r => r.model_id === 'whisper-large-v3')!.enabled).toBe(0);
+
+    // Restore for the following tests.
+    applyCatalog(getDb(), sttCatalog(sttRoster()));
+    getDb().prepare(
+      "UPDATE media_models SET enabled = 1 WHERE modality = 'transcription'",
+    ).run();
+  });
+
+  it('a catalog without the key leaves existing transcription rows untouched', () => {
+    applyCatalog(getDb(), sttCatalog(undefined)); // old payload shape
+    expect(sttRows()).toHaveLength(4);
+  });
+
+  it('prunes dropped transcription rows, scoped to the modality', () => {
+    const roster = sttRoster().filter(m => m.modelId !== '@cf/openai/whisper');
+    const counts = applyCatalog(getDb(), sttCatalog(roster));
+    expect(counts.removed).toBe(1);
+    expect(sttRows().map(r => r.model_id)).not.toContain('@cf/openai/whisper');
+    // Image row untouched by the transcription prune.
+    expect(getDb().prepare(
+      "SELECT id FROM media_models WHERE model_id = '@cf/test/image-model'",
+    ).get()).toBeDefined();
+  });
+
+  it('skips entries for platforms without a transcription adapter', () => {
+    const roster = sttRoster();
+    roster.push({ platform: 'nvidia', modelId: 'parakeet-stt', displayName: 'Parakeet', priority: 9, enabled: true });
+    const counts = applyCatalog(getDb(), sttCatalog(roster));
+    expect(counts.skippedUnknownPlatform).toBeGreaterThanOrEqual(1);
+    expect(sttRows().map(r => r.model_id)).not.toContain('parakeet-stt');
+  });
+
+  it('tombstoned (user-deleted) transcription models stay deleted', () => {
+    recordCatalogModelTombstone(getDb(), 'media', 'groq', 'whisper-large-v3');
+    applyCatalog(getDb(), sttCatalog(sttRoster()));
+    expect(sttRows().map(r => r.model_id)).not.toContain('whisper-large-v3');
+  });
+
+  it('a malformed transcriptionModels key rejects the whole payload', () => {
+    const catalog = sttCatalog(sttRoster());
+    (catalog as any).transcriptionModels = [{ platform: 'groq' }]; // missing required fields
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
+    // isCatalog gates both the network and the cached re-apply paths.
+    expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+// Generative media rows (image/audio) carry adapter metadata in meta_json the
+// same way transcription rows do — the flavour a platform's endpoint expects.
+// Cloudflare hosts both JSON-body image models and the FLUX.2 family, whose
+// schema takes multipart only, so the flag has to survive the sync.
+describe('applyCatalog: generative media meta', () => {
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  function imageCatalog(requestStyle?: string): AnyCatalog {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({
+      platform: 'cloudflare',
+      modelId: '@cf/black-forest-labs/flux-2-klein-4b',
+      displayName: 'FLUX.2 [klein] 4B',
+      modality: 'image',
+      ...(requestStyle ? { requestStyle } : {}),
+    }));
+    models.push(baseModel({
+      platform: 'cloudflare',
+      modelId: '@cf/black-forest-labs/flux-1-schnell',
+      displayName: 'FLUX.1 [schnell]',
+      modality: 'image',
+    }));
+    return catalogOf(models);
+  }
+
+  function metaOf(modelId: string): string | null {
+    return (getDb().prepare('SELECT meta_json FROM media_models WHERE model_id = ?')
+      .get(modelId) as { meta_json: string | null }).meta_json;
+  }
+
+  it('carries requestStyle onto an image row, and leaves rows without one NULL', () => {
+    applyCatalog(getDb(), imageCatalog('multipart'));
+    expect(JSON.parse(metaOf('@cf/black-forest-labs/flux-2-klein-4b')!)).toEqual({ requestStyle: 'multipart' });
+    expect(metaOf('@cf/black-forest-labs/flux-1-schnell')).toBeNull();
+  });
+
+  it('clears meta when the catalog drops requestStyle (full-snapshot semantics)', () => {
+    applyCatalog(getDb(), imageCatalog('multipart'));
+    applyCatalog(getDb(), imageCatalog());
+    expect(metaOf('@cf/black-forest-labs/flux-2-klein-4b')).toBeNull();
+  });
+
+  it('a non-string requestStyle rejects the whole payload', () => {
+    const catalog = imageCatalog('multipart');
+    (catalog.models[catalog.models.length - 2] as any).requestStyle = 42;
     setSetting('catalog_applied_json', JSON.stringify(catalog));
     expect(reapplyCachedCatalog().reapplied).toBe(false);
   });

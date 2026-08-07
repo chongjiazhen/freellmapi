@@ -72,4 +72,25 @@ describe('toGeminiExtendedConfig', () => {
     expect(cfg.topK).toBeUndefined();
     expect(cfg.responseMimeType).toBeUndefined();
   });
+
+  it('reasoning_effort maps to thinkingConfig with the effort-tier budget', () => {
+    expect(toGeminiExtendedConfig({ reasoning_effort: 'low' }).thinkingConfig)
+      .toEqual({ thinkingBudget: 1024, includeThoughts: true });
+    expect(toGeminiExtendedConfig({ reasoning_effort: 'medium' }).thinkingConfig)
+      .toEqual({ thinkingBudget: 8192, includeThoughts: true });
+    expect(toGeminiExtendedConfig({ reasoning_effort: 'high' }).thinkingConfig)
+      .toEqual({ thinkingBudget: 24576, includeThoughts: true });
+  });
+
+  it("reasoning_effort 'none'/'minimal' disables thinking (budget 0)", () => {
+    expect(toGeminiExtendedConfig({ reasoning_effort: 'none' }).thinkingConfig)
+      .toEqual({ thinkingBudget: 0 });
+    expect(toGeminiExtendedConfig({ reasoning_effort: 'minimal' }).thinkingConfig)
+      .toEqual({ thinkingBudget: 0 });
+  });
+
+  it('no reasoning_effort → no thinkingConfig (model default preserved)', () => {
+    expect(toGeminiExtendedConfig({ seed: 1 })).not.toHaveProperty('thinkingConfig');
+    expect(toGeminiExtendedConfig(undefined)).not.toHaveProperty('thinkingConfig');
+  });
 });

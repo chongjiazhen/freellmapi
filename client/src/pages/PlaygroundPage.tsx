@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight, CircleAlert } from 'lucide-react'
+import { ChevronRight, CircleAlert, FileText, Paperclip, X } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { ModelCombobox } from '@/components/model-combobox'
@@ -8,6 +8,24 @@ import { buildModelOptions } from '@/lib/model-groups'
 import { PageHeader } from '@/components/page-header'
 import { Markdown } from '@/components/markdown'
 import { CopyButton } from '@/components/copy-button'
+import { toast } from '@/lib/toast'
+import {
+  ACCEPT_ATTRIBUTE,
+  AttachmentError,
+  MAX_ATTACHMENTS,
+  MAX_IMAGE_BYTES,
+  MAX_TEXT_BYTES,
+  MAX_TOTAL_IMAGE_BYTES,
+  attachmentImages,
+  classifyFile,
+  composeText,
+  dataUrlBytes,
+  formatBytes,
+  readImageAttachment,
+  readTextAttachment,
+  toMessageContent,
+  type Attachment,
+} from '@/lib/attachments'
 import { useI18n } from '@/i18n'
 
 interface FallbackEntry {
@@ -16,15 +34,20 @@ interface FallbackEntry {
   enabled: boolean
   platform: string
   modelId: string
+  canonicalId?: string
   displayName: string
   sizeLabel: string
   intelligenceRank: number
+  supportsVision: boolean
   keyCount: number
 }
 
 interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  // Data URIs of the images attached to this turn: rendered as thumbnails in
+  // the bubble and replayed as `image_url` parts on every follow-up request.
+  images?: string[]
   // Request-level failure rendered as a distinct error bubble, not a fake
   // assistant reply.
   isError?: boolean
@@ -131,8 +154,13 @@ export default function PlaygroundPage() {
   const [selectedModel, setSelectedModel] = useState<string>(
     () => localStorage.getItem('playground.model') ?? 'auto',
   )
+  // Files staged for the NEXT message: images already downscaled to a data URI,
+  // text-like files already decoded. Cleared on send. (#325)
+  const [attachments, setAttachments] = useState<Attachment[]>([])
+  const [dragging, setDragging] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const { data: keyData } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
@@ -152,6 +180,18 @@ export default function PlaygroundPage() {
   // Collapse the same model from multiple providers into one option (value =
   // canonical id, which the proxy resolves to the whole group).
   const modelOptions = buildModelOptions(availableModels, unifyOn)
+
+  // Picker values that can accept images. A unified option counts as vision-
+  // capable when ANY of its providers is, because routing picks a vision member
+  // for image requests. Auto/Fusion are never flagged: the server picks the
+  // model there (and hard-fails with a clear error if none can see).
+  const visionValues = new Set(
+    availableModels.filter(e => e.supportsVision).map(e => e.canonicalId ?? e.modelId),
+  )
+  const pendingImages = attachmentImages(attachments)
+  const modelBlindToImages = pendingImages.length > 0
+    && selectedModel !== 'auto' && selectedModel !== 'fusion'
+    && !visionValues.has(selectedModel)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -209,14 +249,67 @@ export default function PlaygroundPage() {
     flush(false)
   }
 
+  // Stage dropped/pasted/picked files. Every rejection is reported by name so a
+  // silently missing attachment is impossible; accepted files are added in one
+  // batch after the async reads settle.
+  const addFiles = async (files: File[]) => {
+    if (files.length === 0) return
+    const accepted: Attachment[] = []
+    let imageBytes = pendingImages.reduce((sum, url) => sum + dataUrlBytes(url), 0)
+
+    for (const file of files) {
+      if (attachments.length + accepted.length >= MAX_ATTACHMENTS) {
+        toast.error(t('playground.attachTooMany', { count: MAX_ATTACHMENTS }))
+        break
+      }
+      const kind = classifyFile(file)
+      if (!kind) {
+        toast.error(t('playground.attachUnsupported', { name: file.name }))
+        continue
+      }
+      try {
+        if (kind === 'image') {
+          const dataUrl = await readImageAttachment(file)
+          if (imageBytes + dataUrlBytes(dataUrl) > MAX_TOTAL_IMAGE_BYTES) {
+            toast.error(t('playground.attachTooLarge', { name: file.name, max: formatBytes(MAX_TOTAL_IMAGE_BYTES) }))
+            continue
+          }
+          imageBytes += dataUrlBytes(dataUrl)
+          accepted.push({ id: `${Date.now()}-${accepted.length}-${file.name}`, kind, name: file.name, dataUrl })
+        } else {
+          const text = await readTextAttachment(file)
+          accepted.push({ id: `${Date.now()}-${accepted.length}-${file.name}`, kind, name: file.name, text })
+        }
+      } catch (err) {
+        const reason = err instanceof AttachmentError ? err.reason : 'unreadable'
+        toast.error(reason === 'too-large'
+          ? t('playground.attachTooLarge', {
+              name: file.name,
+              max: formatBytes(kind === 'image' ? MAX_IMAGE_BYTES : MAX_TEXT_BYTES),
+            })
+          : t('playground.attachFailed', { name: file.name }))
+      }
+    }
+    if (accepted.length > 0) setAttachments(prev => [...prev, ...accepted])
+  }
+
+  const removeAttachment = (id: string) => setAttachments(prev => prev.filter(a => a.id !== id))
+
   const handleSend = async () => {
     const text = input.trim()
-    if (!text || loading) return
+    if ((!text && attachments.length === 0) || loading) return
 
-    const userMsg: ChatMessage = { role: 'user', content: text }
+    // Text-like files are inlined into the prompt; images ride along as data
+    // URIs and become `image_url` parts in the request envelope below.
+    const userMsg: ChatMessage = {
+      role: 'user',
+      content: composeText(text, attachments),
+      ...(pendingImages.length > 0 ? { images: pendingImages } : {}),
+    }
     const newMessages = [...messages, userMsg]
     setMessages(newMessages)
     setInput('')
+    setAttachments([])
     setLoading(true)
     inputRef.current?.focus()
 
@@ -229,7 +322,7 @@ export default function PlaygroundPage() {
       const body: any = {
         messages: [
           ...(sysPrompt ? [{ role: 'system', content: sysPrompt }] : []),
-          ...newMessages.map(m => ({ role: m.role, content: m.content })),
+          ...newMessages.map(m => ({ role: m.role, content: toMessageContent(m.content, m.images) })),
         ],
       }
       if (selectedModel !== 'auto') body.model = selectedModel
@@ -311,6 +404,7 @@ export default function PlaygroundPage() {
 
   const handleClear = () => {
     setMessages([])
+    setAttachments([])
     inputRef.current?.focus()
   }
 
@@ -334,6 +428,11 @@ export default function PlaygroundPage() {
         isNew: false,
         // Provider names for the multi-provider hover + search; empty when solo.
         platforms: o.providerCount > 1 ? o.platforms : [],
+        // With images staged, flag (and dim) the models that can't read them.
+        // Only a hint — sending anyway is allowed and the server decides.
+        note: pendingImages.length > 0 && !visionValues.has(o.value)
+          ? t('playground.noVisionBadge')
+          : undefined,
       })),
   ]
   function pickModel(v: string) {
@@ -410,6 +509,13 @@ export default function PlaygroundPage() {
                                 : 'bg-muted'
                           }`}
                         >
+                          {msg.images && msg.images.length > 0 && (
+                            <div className="mb-2 flex flex-wrap gap-1.5">
+                              {msg.images.map((src, n) => (
+                                <img key={n} src={src} alt="" className="size-20 rounded-lg object-cover" />
+                              ))}
+                            </div>
+                          )}
                           {msg.isError ? (
                             <div className="flex items-start gap-2">
                               <CircleAlert className="mt-0.5 size-4 shrink-0" />
@@ -490,7 +596,16 @@ export default function PlaygroundPage() {
           )}
         </div>
 
-        <div className="border-t bg-background/50 p-3">
+        <div
+          className={`border-t bg-background/50 p-3 transition-colors ${dragging ? 'bg-primary/5 ring-1 ring-inset ring-primary/40' : ''}`}
+          onDragOver={e => { e.preventDefault(); setDragging(true) }}
+          onDragLeave={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragging(false) }}
+          onDrop={e => {
+            e.preventDefault()
+            setDragging(false)
+            addFiles([...e.dataTransfer.files])
+          }}
+        >
           <div className="mb-2">
             <button
               type="button"
@@ -511,12 +626,68 @@ export default function PlaygroundPage() {
               />
             )}
           </div>
+          {attachments.length > 0 && (
+            <div className="mb-2 flex flex-wrap gap-2">
+              {attachments.map(a => (
+                <div key={a.id} className="relative flex items-center gap-1.5 rounded-lg border bg-background py-1 pl-1.5 pr-6 text-xs">
+                  {a.kind === 'image' && a.dataUrl
+                    ? <img src={a.dataUrl} alt="" className="size-8 rounded object-cover" />
+                    : <FileText className="size-4 shrink-0 text-muted-foreground" />}
+                  <span className="max-w-[140px] truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    aria-label={t('common.remove')}
+                    title={t('common.remove')}
+                    onClick={() => removeAttachment(a.id)}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground"
+                  >
+                    <X className="size-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {modelBlindToImages && (
+            <div className="mb-2 flex items-start gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+              <CircleAlert className="mt-0.5 size-3.5 shrink-0" />
+              <span>{t('playground.visionWarning', { model: activeModelLabel })}</span>
+            </div>
+          )}
           <div className="flex gap-2 items-end">
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept={ACCEPT_ATTRIBUTE}
+              className="hidden"
+              onChange={e => {
+                addFiles([...(e.target.files ?? [])])
+                e.target.value = ''
+              }}
+            />
+            <Button
+              variant="outline"
+              size="icon"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={loading}
+              aria-label={t('playground.attach')}
+              title={t('playground.attach')}
+            >
+              <Paperclip className="size-4" />
+            </Button>
             <textarea
               ref={inputRef}
               value={input}
               onChange={e => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
+              onPaste={e => {
+                // Screenshot straight from the clipboard; a normal text paste
+                // carries no files and falls through untouched.
+                const files = [...e.clipboardData.files]
+                if (files.length === 0) return
+                e.preventDefault()
+                addFiles(files)
+              }}
               placeholder={t('playground.inputPlaceholder')}
               rows={1}
               className="flex-1 resize-none rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[40px] max-h-[160px]"
@@ -527,7 +698,7 @@ export default function PlaygroundPage() {
                 el.style.height = Math.min(el.scrollHeight, 160) + 'px'
               }}
             />
-            <Button onClick={handleSend} disabled={loading || !input.trim()} size="default">
+            <Button onClick={handleSend} disabled={loading || (!input.trim() && attachments.length === 0)} size="default">
               {loading ? t('playground.sending') : t('playground.send')}
             </Button>
           </div>

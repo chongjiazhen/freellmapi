@@ -4,8 +4,9 @@ import type {
   ChatCompletionChunk,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult, type KeyValidationFailure } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { contentToString } from '../lib/content.js';
+import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 
@@ -68,7 +69,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,
@@ -76,7 +77,9 @@ export class CloudflareProvider extends BaseProvider {
         parallel_tool_calls: options?.parallel_tool_calls,
         ...extendedBodyParams(this.platform, options),
       }),
-    }, this.timeoutFor(modelId, options?.timeoutMs));
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, this.timeoutFor(modelId, options?.timeoutMs), { signal: options?.signal, timeoutBounds: 'request' });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -92,6 +95,12 @@ export class CloudflareProvider extends BaseProvider {
     }
 
     const data = await res.json() as ChatCompletionResponse;
+    // Workers AI hosts DeepSeek-style models that inline their reasoning trace
+    // as a leading `<think>…</think>` block in content; move it to
+    // reasoning_content (no-op for messages without the tag).
+    for (const choice of data.choices ?? []) {
+      if (choice?.message) extractThinkFromMessage(choice.message);
+    }
     data._routed_via = { platform: 'cloudflare', model: modelId };
     return data;
   }
@@ -116,7 +125,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,
@@ -125,7 +134,9 @@ export class CloudflareProvider extends BaseProvider {
         ...extendedBodyParams(this.platform, options),
         stream: true,
       }),
-    }, this.timeoutFor(modelId, options?.timeoutMs));
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, this.timeoutFor(modelId, options?.timeoutMs), { signal: options?.signal });
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
       keyId: quotaContext?.keyId,
@@ -140,7 +151,9 @@ export class CloudflareProvider extends BaseProvider {
       throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`);
     }
 
-    yield* this.readSseStream(res);
+    // First-byte grace (#584): reuse the per-model chat timeout (GLM 4.7
+    // Flash's 200s included) as the budget for the first stream read.
+    yield* this.readSseStream(res, { firstByteTimeoutMs: this.timeoutFor(modelId, options?.timeoutMs) });
   }
 
   async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
@@ -177,6 +190,7 @@ export class CloudflareProvider extends BaseProvider {
       url,
       { method: 'GET', headers: { 'Authorization': `Bearer ${token}` } },
       10000,
+      { timeoutBounds: 'request' },
     );
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,

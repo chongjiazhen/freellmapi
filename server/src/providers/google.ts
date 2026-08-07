@@ -11,7 +11,10 @@ import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValida
 import { contentToString } from '../lib/content.js';
 import { proxyFetch } from '../lib/proxy.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
-import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
+import { sanitizeForGemini } from '../lib/gemini-wire.js';
+
+export { sanitizeForGemini } from '../lib/gemini-wire.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -114,12 +117,6 @@ function isGemmaModel(modelId: string): boolean {
   return /(?:^|[/.:])gemma[-_]/.test(normalized);
 }
 
-function optionsForModel(modelId: string, options?: CompletionOptions): CompletionOptions | undefined {
-  if (!isGemmaModel(modelId) || !options) return options;
-  const { tools: _tools, tool_choice: _toolChoice, parallel_tool_calls: _parallelToolCalls, ...rest } = options;
-  return rest;
-}
-
 function systemInstructionText(systemInstruction: { parts?: Array<{ text?: string }> } | undefined): string | null {
   const text = systemInstruction?.parts
     ?.map(part => part.text ?? '')
@@ -128,6 +125,13 @@ function systemInstructionText(systemInstruction: { parts?: Array<{ text?: strin
   return text ? text : null;
 }
 
+// Gemma models on the Gemini API historically 400 with "Developer instruction
+// is not enabled", so system prompts fold into the first user turn instead of
+// riding systemInstruction (#500). Older Gemma 3.x still rejects system
+// instructions and users can register those ids, so the fold stays. Tools and
+// functionCall/functionResponse history are deliberately NOT touched here
+// anymore: Gemma 4 supports native function calling, and stripping them made
+// the dashboard supports_tools toggle a no-op (#582).
 function contentsForModel(
   modelId: string,
   contents: GeminiContent[],
@@ -135,24 +139,13 @@ function contentsForModel(
 ): { contents: GeminiContent[]; systemInstruction?: { parts: Array<{ text: string }> } } {
   if (!isGemmaModel(modelId)) return { contents, systemInstruction };
 
-  const cleaned = contents
-    .map((entry): GeminiContent | null => {
-      const parts = entry.parts.filter(part => !part.functionCall && !part.functionResponse);
-      if (parts.length === 0) return null;
-      return { ...entry, parts };
-    })
-    .filter((entry): entry is GeminiContent => entry !== null);
-  const safeContents = cleaned.length > 0
-    ? cleaned
-    : [{ role: 'user' as const, parts: [{ text: '' }] }];
-
   const systemText = systemInstructionText(systemInstruction);
-  if (!systemText) return { contents: safeContents };
+  if (!systemText) return { contents };
 
   return {
     contents: [
       { role: 'user', parts: [{ text: systemText }] },
-      ...safeContents,
+      ...contents,
     ],
   };
 }
@@ -187,55 +180,21 @@ function toGeminiFinishReason(finishReason?: string): string {
 // Google Gemini accepts only a subset of JSON Schema (~OpenAPI 3.0).
 // Strip fields that opencode / other strict-JSON-Schema clients send but
 // Google rejects with 400 "Unknown name '<field>'".
-const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
-  '$schema', '$id', '$ref', '$defs', '$comment',
-  'definitions',
-  'exclusiveMinimum', 'exclusiveMaximum',
-  'patternProperties', 'unevaluatedProperties', 'unevaluatedItems',
-  'if', 'then', 'else',
-  'contentEncoding', 'contentMediaType', 'contentSchema',
-  'dependentRequired', 'dependentSchemas', 'dependencies',
-  'additionalProperties',
-  'examples', 'const', 'readOnly', 'writeOnly',
-  'uniqueItems',
-  'not', 'allOf', 'oneOf',
-  'prefixItems',
-  'contains', 'minContains', 'maxContains',
-  'propertyNames',
-  'multipleOf',
-  'deprecated',
-]);
-
-const VENDOR_EXTENSION_SCHEMA_KEY = /^x-/i;
-
-export function sanitizeForGemini(schema: unknown): unknown {
-  return sanitizeForGeminiSchema(schema, false);
-}
-
-function sanitizeForGeminiSchema(schema: unknown, insidePropertiesMap: boolean): unknown {
-  if (Array.isArray(schema)) {
-    return schema.map(s => sanitizeForGeminiSchema(s, false));
-  }
-  if (schema && typeof schema === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-      if (insidePropertiesMap) {
-        out[k] = sanitizeForGeminiSchema(v, false);
-        continue;
-      }
-      if (GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(k) || VENDOR_EXTENSION_SCHEMA_KEY.test(k)) continue;
-      out[k] = sanitizeForGeminiSchema(v, k === 'properties');
-    }
-    return out;
-  }
-  return schema;
-}
-
 // OpenAI clients can't express Gemini's native Google Search grounding, so we
 // treat a tool named `google_search` (a few spellings) as the signal to enable
 // it. It maps to Gemini's `{ google_search: {} }` tool rather than a function
 // declaration, and can ride alongside real function tools in the same array. (#59)
 const GROUNDING_TOOL_NAMES = new Set(['google_search', 'googlesearch', 'google_search_retrieval']);
+
+// reasoning_effort → Gemini thinkingBudget (tokens). The low/medium/high
+// budgets follow the common gateway convention (OpenRouter's effort mapping);
+// 'none'/'minimal' disable thinking outright. Models that can't run at the
+// requested budget 400 and fail over like any provider-invalid request.
+const EFFORT_THINKING_BUDGET: Record<'low' | 'medium' | 'high', number> = {
+  low: 1024,
+  medium: 8192,
+  high: 24576,
+};
 
 /**
  * Extended generationConfig knobs translated from the OpenAI wire: topK,
@@ -264,6 +223,17 @@ export function toGeminiExtendedConfig(options?: CompletionOptions): Record<stri
     out.responseMimeType = 'application/json';
     const schema = rf.type === 'json_schema' ? rf.json_schema?.schema : undefined;
     if (schema) out.responseSchema = sanitizeForGemini(schema);
+  }
+  // Request-side reasoning control: reasoning_effort → thinkingConfig. Only
+  // set when the client asked — a request without the knob keeps Gemini's
+  // model-default thinking behavior unchanged. includeThoughts surfaces
+  // thought summaries so reasoning_content flows back out (see
+  // extractReasoningContent).
+  const effort = options?.reasoning_effort;
+  if (effort) {
+    out.thinkingConfig = (effort === 'none' || effort === 'minimal')
+      ? { thinkingBudget: 0 }
+      : { thinkingBudget: EFFORT_THINKING_BUDGET[effort], includeThoughts: true };
   }
   return out;
 }
@@ -549,31 +519,32 @@ export class GoogleProvider extends BaseProvider {
   ): Promise<ChatCompletionResponse> {
     const translated = await toGeminiContents(messages);
     const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
-    const modelOptions = optionsForModel(modelId, options);
 
-    const tools = toGeminiTools(modelOptions?.tools);
+    const tools = toGeminiTools(options?.tools);
     const body: Record<string, unknown> = {
       contents: request.contents,
       generationConfig: {
-        temperature: modelOptions?.temperature,
-        maxOutputTokens: modelOptions?.max_tokens,
-        topP: modelOptions?.top_p,
-        stopSequences: toGeminiStopSequences(modelOptions?.stop),
-        ...toGeminiExtendedConfig(modelOptions),
+        temperature: options?.temperature,
+        maxOutputTokens: options?.max_tokens,
+        topP: options?.top_p,
+        stopSequences: toGeminiStopSequences(options?.stop),
+        ...toGeminiExtendedConfig(options),
       },
       tools,
       // functionCallingConfig is only valid when real function tools are present;
       // a grounding-only request (just google_search) must omit it. (#59)
-      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(modelOptions?.tool_choice) : undefined,
+      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(options?.tool_choice) : undefined,
     };
     if (request.systemInstruction) body.systemInstruction = request.systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+    const url = `${API_BASE}/models/${modelId}:generateContent`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -631,29 +602,30 @@ export class GoogleProvider extends BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk> {
     const translated = await toGeminiContents(messages);
     const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
-    const modelOptions = optionsForModel(modelId, options);
 
-    const tools = toGeminiTools(modelOptions?.tools);
+    const tools = toGeminiTools(options?.tools);
     const body: Record<string, unknown> = {
       contents: request.contents,
       generationConfig: {
-        temperature: modelOptions?.temperature,
-        maxOutputTokens: modelOptions?.max_tokens,
-        topP: modelOptions?.top_p,
-        stopSequences: toGeminiStopSequences(modelOptions?.stop),
-        ...toGeminiExtendedConfig(modelOptions),
+        temperature: options?.temperature,
+        maxOutputTokens: options?.max_tokens,
+        topP: options?.top_p,
+        stopSequences: toGeminiStopSequences(options?.stop),
+        ...toGeminiExtendedConfig(options),
       },
       tools,
-      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(modelOptions?.tool_choice) : undefined,
+      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(options?.tool_choice) : undefined,
     };
     if (request.systemInstruction) body.systemInstruction = request.systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse&key=${apiKey}`;
+    const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -680,9 +652,21 @@ export class GoogleProvider extends BaseProvider {
 
     const seenToolCallKeys = new Set<string>();
 
+    // Same mid-stream inactivity watchdog as readSseStream (#553): this adapter
+    // parses Gemini's own frame format, so it reads the body itself and used to
+    // have no bound at all on a stalled read. Same first-byte grace as
+    // readSseStream too (#584): the chat timeout that bounded the headers also
+    // budgets the first read, floored at the stall budget.
+    const inactivityTimeoutMs = streamStallTimeoutMs(this.platform);
+    const firstByteMs = this.firstByteBudgetMs(options?.timeoutMs ?? this.timeoutMs, inactivityTimeoutMs);
+    let awaitingFirstByte = true;
+
     try {
       while (true) {
-        const { done, value } = await reader.read();
+        const { done, value } = awaitingFirstByte
+          ? await this.readWithStallTimeout(() => reader.read(), firstByteMs, this.firstByteTimeoutMessage(firstByteMs))
+          : await this.readWithStallTimeout(() => reader.read(), inactivityTimeoutMs);
+        awaitingFirstByte = false;
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
@@ -797,9 +781,10 @@ export class GoogleProvider extends BaseProvider {
     // Transport errors propagate — health.ts marks status='error' without
     // counting toward auto-disable.
     const res = await this.fetchWithTimeout(
-      `${API_BASE}/models?key=${apiKey}`,
-      { method: 'GET' },
+      `${API_BASE}/models`,
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey } },
       10000,
+      { timeoutBounds: 'request' },
     );
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,

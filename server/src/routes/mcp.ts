@@ -7,6 +7,7 @@ import { supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { getRoutingScores, getRoutingStrategy, setRoutingStrategy } from '../services/router.js';
 import type { RoutingStrategy } from '../services/scoring.js';
 import { getCacheStats } from '../services/cache.js';
+import { getCompressionStats } from '../services/compression/stats.js';
 
 // ─────────────────────────────────────────────────────────────────────────
 // MCP server for the gateway (POST /mcp) — Model Context Protocol over
@@ -136,10 +137,11 @@ function usageSummary(args: Record<string, unknown>): unknown {
   const totals = db.prepare(`
     SELECT COALESCE(SUM(total_requests), 0) AS requests,
            COALESCE(SUM(success_count), 0) AS successes,
+           COALESCE(SUM(error_count), 0) AS errors,
            COALESCE(SUM(input_tokens), 0) AS input_tokens,
            COALESCE(SUM(output_tokens), 0) AS output_tokens
     FROM request_hourly WHERE hour >= ?
-  `).get(since.slice(0, 13) + ':00:00') as { requests: number; successes: number; input_tokens: number; output_tokens: number };
+  `).get(since.slice(0, 13) + ':00:00') as { requests: number; successes: number; errors: number; input_tokens: number; output_tokens: number };
   const topModels = db.prepare(`
     SELECT platform, model_id, COUNT(*) AS requests,
            SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes
@@ -149,7 +151,8 @@ function usageSummary(args: Record<string, unknown>): unknown {
   return {
     range,
     requests: totals.requests,
-    success_rate: totals.requests > 0 ? Math.round((totals.successes / totals.requests) * 1000) / 10 : null,
+    // Over success+error only: 'canceled' rows (#752) are neither.
+    success_rate: totals.successes + totals.errors > 0 ? Math.round((totals.successes / (totals.successes + totals.errors)) * 1000) / 10 : null,
     input_tokens: totals.input_tokens,
     output_tokens: totals.output_tokens,
     top_models: topModels,
@@ -233,6 +236,11 @@ const TOOLS: Record<string, McpTool> = {
     inputSchema: { type: 'object', properties: {} },
     run: () => getCacheStats(),
   },
+  compression_stats: {
+    description: 'Prompt-compression statistics: requests compressed, estimated tokens saved, fidelity-gate discards, and per-engine savings.',
+    inputSchema: { type: 'object', properties: {} },
+    run: () => getCompressionStats(),
+  },
 };
 
 // ── JSON-RPC dispatch ────────────────────────────────────────────────────
@@ -256,7 +264,7 @@ function dispatchRpc(msg: JsonRpcRequest, id: number | string | null): unknown {
         protocolVersion: PROTOCOL_VERSION,
         capabilities: { tools: {} },
         serverInfo: { name: 'freellmapi', version: '1.0.0' },
-        instructions: 'FreeLLMAPI gateway introspection: list usable free models (with per-model supported_parameters), check provider/key health, read usage and cache stats, and switch the routing strategy. Inference goes through the OpenAI-compatible /v1 endpoints, not MCP.',
+        instructions: 'FreeLLMAPI gateway introspection: list usable free models (with per-model supported_parameters), check provider/key health, read usage/cache/compression stats, and switch the routing strategy. Inference goes through the OpenAI-compatible /v1 endpoints, not MCP.',
       });
     }
     case 'ping':

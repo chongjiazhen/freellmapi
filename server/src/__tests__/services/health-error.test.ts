@@ -62,8 +62,13 @@ describe('persisted key health diagnostics', () => {
     validateKey.mockRejectedValue(new Error('Bearer secret-token-value-1234567890 failed at https://api.example.test/models'));
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    expect(await checkKeyHealth(id)).toBe('error');
-    expect(row(id).last_health_error).toBe('Bearer [redacted] failed at [redacted-url]');
+    // Seeded as 'unknown', and a transport error preserves that rather than
+    // demoting to 'error' — the diagnostic is still recorded either way.
+    expect(await checkKeyHealth(id)).toBe('unknown');
+    expect(row(id)).toMatchObject({
+      status: 'unknown',
+      last_health_error: 'Bearer [redacted] failed at [redacted-url]',
+    });
     expect(String(error.mock.calls[0][0])).not.toContain('secret-token-value');
   });
 

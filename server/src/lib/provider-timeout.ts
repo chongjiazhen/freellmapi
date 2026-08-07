@@ -7,9 +7,16 @@
 //
 // PROVIDER_STREAM_STALL_TIMEOUT_MS is the streaming counterpart for the
 // mid-stream inactivity watchdog (issue #553): how long an SSE stream may go
-// without a single byte before the gateway gives up on it. It is global, not
-// per-platform: a stall looks the same everywhere, and the per-platform knob
-// above already covers the slow-first-byte case.
+// without a single byte before the gateway gives up on it.
+// PROVIDER_STREAM_STALL_TIMEOUT_<PLATFORM> (issue #584) overrides it for one
+// platform; precedence is per-platform > global > built-in default (90s).
+//
+// The stall watchdog does NOT bound time-to-first-byte: the FIRST read of a
+// stream gets a grace budget derived from the platform's chat timeout (the
+// PROVIDER_TIMEOUT_<PLATFORM> knob above), floored at the stall budget — see
+// BaseProvider.readSseStream. Before #584 the stall budget also bounded the
+// first byte, which killed healthy long prefills (NVIDIA NIM sends SSE headers
+// instantly, then prefills 100k-token prompts for minutes) at 90s.
 
 const warned = new Set<string>();
 
@@ -47,10 +54,19 @@ export function providerTimeoutMs(platform: string, defaultMs: number): number {
 
 export const DEFAULT_STREAM_STALL_TIMEOUT_MS = 90_000;
 
-/** Effective mid-stream inactivity timeout (PROVIDER_STREAM_STALL_TIMEOUT_MS,
- * default 90s, 0 disables). Resolved per call so tests can vary the env. */
-export function streamStallTimeoutMs(): number {
-  return parseTimeoutEnv('PROVIDER_STREAM_STALL_TIMEOUT_MS', DEFAULT_STREAM_STALL_TIMEOUT_MS);
+export function streamStallTimeoutEnvName(platform: string): string {
+  return `PROVIDER_STREAM_STALL_TIMEOUT_${platform.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+}
+
+/** Effective mid-stream inactivity timeout, 0 disables. Resolved per call so
+ * tests can vary the env. Precedence (#584): the per-platform
+ * PROVIDER_STREAM_STALL_TIMEOUT_<PLATFORM> when a platform is given and the
+ * var is set and valid, else the global PROVIDER_STREAM_STALL_TIMEOUT_MS,
+ * else the built-in 90s default. */
+export function streamStallTimeoutMs(platform?: string): number {
+  const globalMs = parseTimeoutEnv('PROVIDER_STREAM_STALL_TIMEOUT_MS', DEFAULT_STREAM_STALL_TIMEOUT_MS);
+  if (!platform) return globalMs;
+  return parseTimeoutEnv(streamStallTimeoutEnvName(platform), globalMs);
 }
 
 /** Test hook: forget which malformed values have already been warned about. */

@@ -13,6 +13,18 @@ const REQUEST_CLIENT_INFO_FILENAME = '20260706_000001_request_client_info.ts';
 const CUSTOM_MODEL_TOOL_SUPPORT_FILENAME = '20260706_000002_custom_model_tool_support.ts';
 const PROFILE_CHAIN_BACKFILL_FILENAME = '20260714_000001_profile_chain_backfill.ts';
 const KEY_HEALTH_ERROR_FILENAME = '20260720_000001_key_health_error.ts';
+const COOLDOWN_PROBE_PROVENANCE_FILENAME = '20260726_000001_cooldown_probe_provenance.ts';
+const REQUEST_ATTEMPTS_FILENAME = '20260726_000002_request_attempts.ts';
+const MODEL_SOURCE_PROVENANCE_FILENAME = '20260726_000003_model_source_provenance.ts';
+const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
+const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
+const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
+const AGENT_COMPATIBILITY_FILENAME = '20260727_000001_agent_compatibility.ts';
+const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
+const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
+const CUSTOM_ENDPOINT_HOST_LABELS_FILENAME = '20260802_000001_custom_endpoint_host_labels.ts';
+const KEY_MODEL_SCOPE_FILENAME = '20260805_000001_key_model_scope.ts';
+const CLIENT_PROFILES_FILENAME = '20260805_000002_client_profiles.ts';
 
 interface SchemaRow {
   type: string;
@@ -72,6 +84,18 @@ describe('migration round trip', () => {
         CUSTOM_MODEL_TOOL_SUPPORT_FILENAME,
         PROFILE_CHAIN_BACKFILL_FILENAME,
         KEY_HEALTH_ERROR_FILENAME,
+        COOLDOWN_PROBE_PROVENANCE_FILENAME,
+        REQUEST_ATTEMPTS_FILENAME,
+        MODEL_SOURCE_PROVENANCE_FILENAME,
+        MEDIA_MODEL_META_FILENAME,
+        REQUEST_SERVED_MODEL_FILENAME,
+        ATTEMPT_ERROR_SUMMARY_FILENAME,
+        AGENT_COMPATIBILITY_FILENAME,
+        TOMBSTONE_PROVENANCE_FILENAME,
+        CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME,
+        CUSTOM_ENDPOINT_HOST_LABELS_FILENAME,
+        KEY_MODEL_SCOPE_FILENAME,
+        CLIENT_PROFILES_FILENAME,
       ]);
     } finally {
       db.close();
@@ -90,8 +114,16 @@ describe('migration round trip', () => {
       // post-migration state, tools = 1) so the round trip actually exercises
       // that migration's down (tools -> 0) and up (tools -> 1).
       db.prepare(`
-        INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, supports_tools, supports_vision, enabled)
-        VALUES ('custom', 'roundtrip-custom', 'Roundtrip Custom', 50, 50, 1, 0, 1)
+        INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, supports_tools, supports_vision, enabled, source)
+        VALUES ('custom', 'roundtrip-custom', 'Roundtrip Custom', 50, 50, 1, 0, 1, 'user')
+      `).run();
+
+      // Same reasoning for the endpoint-label rename (#704): it only touches
+      // custom api_keys rows, so seed one in its post-migration state (labelled
+      // with its host) for the down (host -> 'Custom') and up to exercise.
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, base_url)
+        VALUES ('custom', '127.0.0.1:11434', 'x', 'x', 'x', 'http://127.0.0.1:11434/v1')
       `).run();
 
       const fullState = snapshotAppState(db);

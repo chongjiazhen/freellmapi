@@ -2241,7 +2241,11 @@ function ensureUnifiedKey(db: Db) {
   if (!existing) {
     const key = `freellmapi-${crypto.randomBytes(24).toString('hex')}`;
     db.prepare("INSERT INTO settings (key, value) VALUES ('unified_api_key', ?)").run(key);
-    console.log(`\n  Your unified API key: ${key}\n`);
+    // Straight to stdout, deliberately bypassing the console redaction installed
+    // in index.ts: this is the one intentional disclosure of the key, and the
+    // operator needs to copy it to configure a client. Every other path that
+    // echoes a credential is an accident and stays redacted.
+    process.stdout.write(`\n  Your unified API key: ${key}\n\n`);
   }
 }
 

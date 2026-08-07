@@ -13,6 +13,8 @@ afterEach(() => {
   delete process.env.PROVIDER_TIMEOUT_NVIDIA;
   delete process.env.PROVIDER_TIMEOUT_GROQ;
   delete process.env.PROVIDER_STREAM_STALL_TIMEOUT_MS;
+  delete process.env.PROVIDER_STREAM_STALL_TIMEOUT_NVIDIA;
+  delete process.env.PROVIDER_STREAM_STALL_TIMEOUT_GROQ;
   resetTimeoutWarnings();
   vi.restoreAllMocks();
 });
@@ -68,5 +70,37 @@ describe('streamStallTimeoutMs', () => {
     expect(streamStallTimeoutMs()).toBe(240_000);
     process.env.PROVIDER_STREAM_STALL_TIMEOUT_MS = '0';
     expect(streamStallTimeoutMs()).toBe(0);
+  });
+
+  // Per-platform stall override (issue #584): symmetric with
+  // PROVIDER_TIMEOUT_<PLATFORM>; per-platform wins over global wins over default.
+  it('PROVIDER_STREAM_STALL_TIMEOUT_<PLATFORM> wins over the global value', () => {
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_MS = '240000';
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_NVIDIA = '30000';
+    expect(streamStallTimeoutMs('nvidia')).toBe(30_000);
+    // Other platforms stay on the global value.
+    expect(streamStallTimeoutMs('groq')).toBe(240_000);
+    // And the bare (platform-less) call is unchanged.
+    expect(streamStallTimeoutMs()).toBe(240_000);
+  });
+
+  it('per-platform override works without a global override (falls back through to the default otherwise)', () => {
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_NVIDIA = '30000';
+    expect(streamStallTimeoutMs('nvidia')).toBe(30_000);
+    expect(streamStallTimeoutMs('groq')).toBe(DEFAULT_STREAM_STALL_TIMEOUT_MS);
+  });
+
+  it('per-platform 0 disables the watchdog for that platform only', () => {
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_NVIDIA = '0';
+    expect(streamStallTimeoutMs('nvidia')).toBe(0);
+    expect(streamStallTimeoutMs('groq')).toBe(DEFAULT_STREAM_STALL_TIMEOUT_MS);
+  });
+
+  it('a malformed per-platform value warns and falls back to the global/default chain', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_MS = '240000';
+    process.env.PROVIDER_STREAM_STALL_TIMEOUT_NVIDIA = 'ninety';
+    expect(streamStallTimeoutMs('nvidia')).toBe(240_000);
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });

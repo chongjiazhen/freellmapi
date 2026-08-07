@@ -70,9 +70,30 @@ export function connectDb(
   db = factory(resolvedPath);
   if (!isMemory) db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  // The dashboard and the proxy hot path write concurrently; without a busy
+  // timeout the loser of a write race gets SQLITE_BUSY immediately and the
+  // request fails. Five seconds is far longer than any write here takes.
+  db.pragma('busy_timeout = 5000');
+
+  if (!isMemory) restrictDbFilePermissions(resolvedPath);
 
   console.log(`Database initialized at ${resolvedPath}`);
   return db;
+}
+
+/** Restrict the DB and its WAL sidecars to the owner. The file holds encrypted
+ *  provider keys plus the dashboard password hash, so it must not be readable by
+ *  other local users. Best-effort: filesystems without POSIX modes (Windows,
+ *  some mounts) throw, and that must not stop startup. */
+function restrictDbFilePermissions(resolvedPath: string): void {
+  for (const suffix of ['', '-wal', '-shm']) {
+    const target = `${resolvedPath}${suffix}`;
+    try {
+      if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
+    } catch {
+      // Non-fatal: permissions are a hardening measure, not a correctness one.
+    }
+  }
 }
 
 export function initDb(

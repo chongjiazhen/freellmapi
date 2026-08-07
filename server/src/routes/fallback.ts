@@ -7,12 +7,14 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
 import { getDb } from '../db/index.js';
-import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy, setCustomWeights } from '../services/router.js';
+import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy, setCustomWeights, getExploreEnabled, setExploreEnabled } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
 import { parseBudget } from '../lib/budget.js';
 import { getModelGroups } from '../services/model-groups.js';
 import { getPenaltyInspector } from '../services/penalty-inspector.js';
 import { getActiveProfileId } from '../services/profile-models.js';
+import { qualifiedModelMemberId } from '../lib/endpoint-scope.js';
+import { overriddenFieldNames } from '../services/model-state.js';
 
 export const fallbackRouter = Router();
 
@@ -36,6 +38,8 @@ const routingSchema = z.object({
     speed: z.number().nonnegative(),
     intelligence: z.number().nonnegative(),
   }).optional(),
+  // Exploration toggle: give unmeasured models a guaranteed chance to be tried.
+  exploreEnabled: z.boolean().optional(),
 });
 
 // PUT /routing → switch strategy. Presets are just weight vectors over the three
@@ -58,7 +62,10 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
     }
   }
   setRoutingStrategy(parsed.data.strategy as RoutingStrategy);
-  res.json({ strategy: getRoutingStrategy(), presets: BANDIT_PRESETS });
+  if (parsed.data.exploreEnabled !== undefined) {
+    setExploreEnabled(parsed.data.exploreEnabled);
+  }
+  res.json({ strategy: getRoutingStrategy(), exploreEnabled: getExploreEnabled(), presets: BANDIT_PRESETS });
 });
 
 // Get fallback chain (with dynamic penalties)
@@ -71,12 +78,16 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, ak.label AS key_label,
-           mo.overrides_json IS NOT NULL AS has_overrides
+           m.key_id, m.endpoint_scope, ak.label AS key_label,
+           mo.overrides_json IS NOT NULL AS has_overrides,
+           mo.overrides_json,
+           ts.source AS tombstone_source, ts.reason AS tombstone_reason
     FROM profile_models pm
     JOIN models m ON m.id = pm.model_db_id
     LEFT JOIN api_keys ak ON ak.id = m.key_id
     LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
+    LEFT JOIN catalog_model_tombstones ts
+      ON ts.kind = 'chat' AND ts.platform = m.platform AND ts.model_id = m.model_id
     WHERE pm.profile_id = ? AND m.enabled = 1
     ORDER BY pm.priority ASC
   `).all(activeProfileId) as any[];
@@ -88,12 +99,16 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
            m.tpm_limit, m.tpd_limit, m.context_window,
            m.monthly_token_budget, m.supports_vision, m.supports_tools,
-           m.key_id, ak.label AS key_label,
-           mo.overrides_json IS NOT NULL AS has_overrides
+           m.key_id, m.endpoint_scope, ak.label AS key_label,
+           mo.overrides_json IS NOT NULL AS has_overrides,
+           mo.overrides_json,
+           ts.source AS tombstone_source, ts.reason AS tombstone_reason
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
     LEFT JOIN api_keys ak ON ak.id = m.key_id
     LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
+    LEFT JOIN catalog_model_tombstones ts
+      ON ts.kind = 'chat' AND ts.platform = m.platform AND ts.model_id = m.model_id
     WHERE m.enabled = 1
     ORDER BY fc.priority ASC
     `).all() as any[];
@@ -159,7 +174,24 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
       keyId: r.key_id ?? null,
       keyLabel: r.key_label ?? null,
+      // Which relay endpoint a custom row belongs to, and the id that names it
+      // unambiguously (#651). Null for catalog models only — every custom row
+      // bound to an endpoint carries both, including a lone one. Deciding when
+      // they are worth showing is the client's job (see memberProviderLabel /
+      // providerPinId / memberEndpointTitle): it reveals them only where two
+      // endpoints actually serve the same model id.
+      endpointScope: r.endpoint_scope || null,
+      qualifiedModelId: qualifiedModelMemberId(r.platform, r.model_id, r.endpoint_scope),
       hasOverrides: Boolean(r.has_overrides),
+      // Which fields the local override actually replaces, so the model page
+      // can mark the individual inputs it edits (#551).
+      overrideFields: overriddenFieldNames(r.overrides_json),
+      // Why the switch is off: a model auto-disabled because the provider
+      // retired it upstream (410 / end of life, #634) is a different state from
+      // one the user turned off, and the dashboard says so. The reason is the
+      // provider's own (redacted) wording.
+      retiredUpstream: r.tombstone_source === 'upstream_eol',
+      retiredReason: r.tombstone_source === 'upstream_eol' ? (r.tombstone_reason ?? null) : null,
       keyCount: keyCountMap.get(r.platform) ?? 0,
     };
   }));

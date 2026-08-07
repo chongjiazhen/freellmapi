@@ -264,6 +264,8 @@ describe('Rate Limiter', () => {
     it('defaults to OpenRouter ~1000/day and allows env override / disable', () => {
       delete process.env[ENV];
       expect(getProviderDailyRequestCap('openrouter')).toBe(1000);
+      // ModelScope: 2000/day account-wide upstream, shipped as 1800 for margin (#581).
+      expect(getProviderDailyRequestCap('modelscope')).toBe(1800);
       expect(getProviderDailyRequestCap('groq')).toBeNull(); // no shared cap
       process.env[ENV] = '50';
       expect(getProviderDailyRequestCap('openrouter')).toBe(50);
@@ -313,7 +315,7 @@ describe('Rate Limiter', () => {
           'navy', ?, ?, 1, 1, 'Large', 20, NULL, NULL, ?,
           ?, NULL, 1, 0, 1
         )
-        ON CONFLICT(platform, model_id) DO UPDATE SET
+        ON CONFLICT(platform, model_id, endpoint_scope) DO UPDATE SET
           tpd_limit = excluded.tpd_limit,
           monthly_token_budget = excluded.monthly_token_budget
       `).run(modelId, `${modelId} (NavyAI)`, tpdLimit, monthlyTokenBudget);
@@ -401,5 +403,23 @@ describe('parseRetryAfterMs', () => {
     expect(parseRetryAfterMs(null)).toBeUndefined();
     expect(parseRetryAfterMs('')).toBeUndefined();
     expect(parseRetryAfterMs('soon')).toBeUndefined();
+  });
+
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  it('clamps an absurd delta-seconds value to 24h', () => {
+    // Feeds the cooldown expiry directly, so an unclamped value benches the key
+    // effectively forever.
+    expect(parseRetryAfterMs('99999999999')).toBe(DAY_MS);
+    expect(parseRetryAfterMs(String(DAY_MS / 1000 + 1))).toBe(DAY_MS);
+  });
+
+  it('clamps a far-future HTTP-date to 24h', () => {
+    expect(parseRetryAfterMs(new Date(Date.now() + 30 * DAY_MS).toUTCString())).toBe(DAY_MS);
+  });
+
+  it('leaves values at or under 24h untouched', () => {
+    expect(parseRetryAfterMs(String(DAY_MS / 1000))).toBe(DAY_MS);
+    expect(parseRetryAfterMs('3600')).toBe(3_600_000);
   });
 });

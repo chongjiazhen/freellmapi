@@ -19,7 +19,9 @@ const { checkKeyHealth } = await import('../../services/health.js');
 // that drops the leading "[Health] Key N (" prefix or removes the platform/base
 // context will silently break attribution. These tests pin the format.
 
-const ERROR_RE = /^\[Health\] Key (\d+) \(([^,]+), base=([^)]+)\) transport error: (.+)$/;
+// The trailing "— status preserved as '<status>'" records that a transport error
+// deliberately no longer demotes the key; the error message is captured up to it.
+const ERROR_RE = /^\[Health\] Key (\d+) \(([^,]+), base=([^)]+)\) transport error: (.+?)(?: — status preserved as '(\w+)')?$/;
 
 beforeAll(() => {
   process.env.ENCRYPTION_KEY = '0'.repeat(64);
@@ -61,7 +63,12 @@ describe('checkKeyHealth transport-error log format', () => {
   it('emits a single line including platform and base_url', async () => {
     const id = seedKey('openai-compat', 'https://api.example.com/v1');
     const status = await checkKeyHealth(id);
-    expect(status).toBe('error');
+    // A transport error is evidence about the network, not the key: the prior
+    // status is kept so the key stays routable (selectKeyForModel only accepts
+    // 'healthy'/'unknown', so demoting here would silently drop its capacity).
+    expect(status).toBe('healthy');
+    const persisted = getDb().prepare('SELECT status FROM api_keys WHERE id = ?').get(id) as { status: string };
+    expect(persisted.status).toBe('healthy');
 
     expect(consoleSpy).toHaveBeenCalledTimes(1);
     const line = firstLine();
@@ -78,7 +85,7 @@ describe('checkKeyHealth transport-error log format', () => {
   it('falls back to base=default when base_url is null', async () => {
     const id = seedKey('nvidia', null);
     const status = await checkKeyHealth(id);
-    expect(status).toBe('error');
+    expect(status).toBe('healthy');
 
     const line = firstLine();
     expect(line).toMatch(ERROR_RE);

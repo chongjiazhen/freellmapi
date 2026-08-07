@@ -12,6 +12,18 @@ npm test                # server vitest; also runs client tests if present
 npm run build           # compile server and dashboard
 ```
 
+For a repeatable local setup, run the bootstrap script for your shell. It only
+installs dependencies when `package-lock.json` has changed and creates `.env`
+when it is absent:
+
+```powershell
+.\scripts\dev-bootstrap.ps1
+```
+
+```bash
+./scripts/dev-bootstrap.sh
+```
+
 Every PR should:
 
 - Include a test, and keep the existing suite green (`npm test`).
@@ -31,6 +43,13 @@ npm run db:migration:create --name=add_embedding_index
 npm run db:migration:up
 npm run db:migration:down
 ```
+
+## Translations
+
+The dashboard ships 60 locales. `en.json` is the source of truth and every other file mirrors
+its keys, so run `npm run check:i18n` from `client/` before opening a PR. See
+[docs/translating.md](docs/translating.md) for the full rules and the settled Chinese
+terminology.
 
 ## AI and LLM-assisted contributions
 

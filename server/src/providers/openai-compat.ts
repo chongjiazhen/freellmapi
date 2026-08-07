@@ -6,11 +6,13 @@ import type {
   Platform,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
+import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { isAbortLikeError } from '../lib/error-classify.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -185,7 +187,7 @@ export class OpenAICompatProvider extends BaseProvider {
         model: modelId,
         messages: this.messagesForPlatform(messages),
         temperature: sampling.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
@@ -193,7 +195,9 @@ export class OpenAICompatProvider extends BaseProvider {
         parallel_tool_calls: this.resolveParallelToolCalls(options),
         ...extendedBodyParams(this.platform, options),
       }),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -228,6 +232,10 @@ export class OpenAICompatProvider extends BaseProvider {
     try {
       data = await res.json() as ChatCompletionResponse;
     } catch (err) {
+      // An aborted body read (per-attempt deadline, client disconnect) is not
+      // a malformed body — rethrow so it keeps its abort classification
+      // instead of reading as a "non-OpenAI-compatible endpoint" below.
+      if (isAbortLikeError(err)) throw err;
       parseErr = err;
       data = undefined as unknown as ChatCompletionResponse;
     }
@@ -298,7 +306,7 @@ export class OpenAICompatProvider extends BaseProvider {
         model: modelId,
         messages: this.messagesForPlatform(messages),
         temperature: sampling.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: sampling.topP,
         stop: options?.stop,
         tools: options?.tools,
@@ -307,7 +315,9 @@ export class OpenAICompatProvider extends BaseProvider {
         ...extendedBodyParams(this.platform, options),
         stream: true,
       }),
-    }, options?.timeoutMs ?? this.timeoutMs);
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
 
     recordQuotaObservationsFromResponse(res, {
       platform: this.platform,
@@ -332,33 +342,63 @@ export class OpenAICompatProvider extends BaseProvider {
       throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`);
     }
 
-    yield* this.readSseStream(res);
+    // First-byte grace (#584): the same chat timeout that bounded the headers
+    // also budgets the first stream read — NIM-style providers send SSE
+    // headers instantly, then prefill long prompts for minutes.
+    yield* this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs });
   }
 
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
-    // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
-    // health.ts catches them and marks status='error' WITHOUT incrementing
-    // the consecutive-failure counter — only confirmed 401/403 disables a key.
-    const url = this.validateUrl ?? `${this.baseUrl}/models`;
+  /** This provider's OpenAI-style model catalog URL. */
+  get modelsUrl(): string {
+    return `${this.baseUrl}/models`;
+  }
+
+  /**
+   * GET a catalog-style endpoint with this provider's auth header, extra
+   * headers, proxy routing, timeout policy and quota bookkeeping. Shared by
+   * validateKey (which only reads the status) and custom-endpoint model
+   * discovery (#488), which also reads the body — one place owns how we talk
+   * to a provider's /models route.
+   *
+   * Note: transport errors (DNS / timeout / TLS) propagate to the caller.
+   * health.ts catches them and marks status='error' WITHOUT incrementing the
+   * consecutive-failure counter — only confirmed 401/403 disables a key.
+   */
+  protected fetchCatalogEndpoint(url: string, apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
     // 30s (not 10s): some upstreams return a large /v1/models catalog that
     // takes >10s from high-latency regions (e.g. NVIDIA NIM measured ~11.2s
     // from India). A 10s cap aborted those calls and health.ts marked a
     // perfectly good key status='error'. 30s aligns with chatCompletion's
     // own slow-upstream allowance and costs nothing for fast providers.
-    const res = await this.fetchWithTimeout(url, {
+    return this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
         ...this.authHeader(apiKey),
         ...this.extraHeaders,
       },
-    }, 30000);
-    recordQuotaObservationsFromResponse(res, {
-      platform: this.platform,
-      keyId: quotaContext?.keyId,
-      providerAccountId: quotaContext?.providerAccountId,
-      quotaPoolKey: quotaContext?.quotaPoolKey,
-      endpoint: 'models',
+      // 'request' bounds: a catalog body that hangs mid-transfer must not
+      // stall the health cycle past the deadline.
+    }, 30000, { timeoutBounds: 'request' }).then(res => {
+      recordQuotaObservationsFromResponse(res, {
+        platform: this.platform,
+        keyId: quotaContext?.keyId,
+        providerAccountId: quotaContext?.providerAccountId,
+        quotaPoolKey: quotaContext?.quotaPoolKey,
+        endpoint: 'models',
+      });
+      return res;
     });
+  }
+
+  /** The raw `${baseUrl}/models` response, body unread. Used by custom-endpoint
+   *  model discovery (#488); unlike validateKey it always hits /models, never a
+   *  provider-specific validateUrl, because the caller wants the catalog. */
+  fetchModelCatalog(apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
+    return this.fetchCatalogEndpoint(this.modelsUrl, apiKey, quotaContext);
+  }
+
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
+    const res = await this.fetchCatalogEndpoint(this.validateUrl ?? this.modelsUrl, apiKey, quotaContext);
     return this.validationResult(res);
   }
 }
@@ -385,6 +425,12 @@ function normalizeChoices(data: ChatCompletionResponse): void {
         .map(seg => (typeof seg === 'string' ? seg : (seg.text ?? '')))
         .join('');
     }
+    // Inline `<think>…</think>` extraction (DeepSeek-style) BEFORE the fold
+    // below: a leading think block moves out of content into
+    // reasoning_content. Runs before the fold so a think-only message (no
+    // answer after the block) still folds back into content and is never
+    // returned as an empty assistant message.
+    extractThinkFromMessage(msg);
     // Fold reasoning into content if content is empty AND there are no
     // tool_calls. With tool_calls present, content=null is the correct OpenAI
     // shape; folding reasoning would confuse clients that branch on content.

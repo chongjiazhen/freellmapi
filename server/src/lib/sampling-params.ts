@@ -24,6 +24,64 @@
 import { z } from 'zod';
 import type { Platform } from '@freellmapi/shared/types.js';
 
+// OpenAI's request-side reasoning knob. Wire values as of the current OpenAI
+// API: 'minimal'|'low'|'medium'|'high', plus 'none' (gpt-5.1). Forwarded
+// verbatim to openai-compat platforms per the policy below; the Google
+// adapter maps it natively onto generationConfig.thinkingConfig.
+export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high'] as const;
+export type ReasoningEffort = typeof REASONING_EFFORTS[number];
+
+// Effort spellings clients actually send that aren't on OpenAI's scale, mapped
+// to the nearest value we do support (#619: a strict enum turned a client's
+// `reasoning_effort: 'max'` into a 400 from our own edge — a knob nobody asked
+// to be fatal). Values that mean "let the model decide" ('auto', 'adaptive',
+// 'default') are deliberately absent: they resolve to undefined below, i.e.
+// nothing is forwarded and the provider default stands — same rule
+// effortFromGeminiThinking applies to a -1 thinking budget.
+const EFFORT_ALIASES: Readonly<Record<string, ReasoningEffort>> = {
+  max: 'high', maximum: 'high', highest: 'high', ultra: 'high', xhigh: 'high', 'x-high': 'high',
+  mid: 'medium', moderate: 'medium', balanced: 'medium', normal: 'medium', standard: 'medium',
+  min: 'minimal', minimum: 'minimal', lowest: 'minimal', xlow: 'minimal', 'x-low': 'minimal',
+  off: 'none', disabled: 'none', disable: 'none',
+};
+
+/**
+ * Coerce a client-supplied effort value onto our scale: supported values pass
+ * through, known aliases clamp to the nearest supported one, and anything
+ * else (unknown word, wrong type, "auto") yields undefined — the knob is
+ * dropped and the provider's own default applies. Never throws, so a bad
+ * effort can't fail a request. Exported for tests.
+ */
+export function normalizeReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  if (typeof value !== 'string') return undefined;
+  const key = value.trim().toLowerCase();
+  if ((REASONING_EFFORTS as readonly string[]).includes(key)) return key as ReasoningEffort;
+  return EFFORT_ALIASES[key];
+}
+
+/**
+ * Clamp an effort to the nearest value a platform actually accepts, walking
+ * the ordered scale outward from the requested one (ties go to the stronger
+ * value, so 'medium' on a low/high platform becomes 'high'). Returns
+ * undefined only when the platform accepts nothing.
+ */
+function clampEffortTo(effort: ReasoningEffort, supported: readonly ReasoningEffort[]): ReasoningEffort | undefined {
+  if (supported.includes(effort)) return effort;
+  const want = REASONING_EFFORTS.indexOf(effort);
+  let best: ReasoningEffort | undefined;
+  let bestDistance = Infinity;
+  for (const candidate of supported) {
+    const distance = Math.abs(REASONING_EFFORTS.indexOf(candidate) - want);
+    if (distance < bestDistance
+        || (distance === bestDistance && best !== undefined
+            && REASONING_EFFORTS.indexOf(candidate) > REASONING_EFFORTS.indexOf(best))) {
+      best = candidate;
+      bestDistance = distance;
+    }
+  }
+  return best;
+}
+
 // Every field is `.nullable()` because real clients serialize their whole
 // request struct and send explicit nulls for unset knobs (#200); null is
 // treated as absent and never forwarded.
@@ -44,6 +102,17 @@ export const samplingParamSchemaFields = {
       strict: z.boolean().nullable().optional(),
       schema: z.record(z.string(), z.unknown()).optional(),
     }).passthrough().optional(),
+  }).passthrough().nullable().optional(),
+  // Accepted as free-form and normalized by pickSamplingParams rather than
+  // validated against the enum: clients invent effort values ('max', 'xhigh')
+  // and rejecting them made an advisory knob fatal (#619).
+  reasoning_effort: z.unknown().optional(),
+  // Object-form alias some clients send (OpenRouter-style chat clients, and
+  // the Responses API's native shape): `reasoning: { effort }`. Resolved into
+  // reasoning_effort by pickSamplingParams; the wrapper object itself is never
+  // forwarded. Extra keys (summary, max_tokens…) are tolerated and ignored.
+  reasoning: z.object({
+    effort: z.unknown().optional(),
   }).passthrough().nullable().optional(),
   // OpenAI's newer alias for max_tokens; surfaces resolve it into max_tokens
   // themselves (it is not a forwarded param of its own).
@@ -70,17 +139,22 @@ export interface ExtendedSamplingOptions {
   logprobs?: boolean;
   top_logprobs?: number;
   response_format?: ResponseFormat;
+  reasoning_effort?: ReasoningEffort;
 }
 
 export const EXTENDED_SAMPLING_KEYS = [
   'top_k', 'min_p', 'seed', 'presence_penalty', 'frequency_penalty',
   'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
-  'response_format',
+  'response_format', 'reasoning_effort',
 ] as const;
 export type ExtendedSamplingKey = typeof EXTENDED_SAMPLING_KEYS[number];
 
 type ParsedSamplingBody = {
   [K in ExtendedSamplingKey]?: unknown;
+} & {
+  // Object-form reasoning alias (see samplingParamSchemaFields); resolved into
+  // reasoning_effort below, never forwarded as-is.
+  reasoning?: { effort?: unknown } | null;
 };
 
 /**
@@ -95,7 +169,19 @@ export function pickSamplingParams(body: ParsedSamplingBody): ExtendedSamplingOp
     const value = body[key];
     if (value === undefined || value === null) continue;
     if (key === 'response_format' && (value as { type?: string }).type === 'text') continue;
+    if (key === 'reasoning_effort') {
+      const effort = normalizeReasoningEffort(value);
+      if (effort === undefined) continue;
+      out[key] = effort;
+      continue;
+    }
     out[key] = value;
+  }
+  // Object-form fallback: `reasoning: { effort }` fills reasoning_effort only
+  // when the flat field wasn't sent (the explicit flat form wins on conflict).
+  if (out.reasoning_effort === undefined) {
+    const effort = normalizeReasoningEffort(body.reasoning?.effort);
+    if (effort !== undefined) out.reasoning_effort = effort;
   }
   return out as ExtendedSamplingOptions;
 }
@@ -117,6 +203,20 @@ export interface PlatformParamPolicy {
   // are 'text' and 'json_schema'."). Upgrade json_object to a permissive
   // json_schema on the wire instead of dropping structured output entirely.
   jsonObjectToSchema?: boolean;
+  // The effort values this platform's API accepts, when it accepts fewer than
+  // the full scale. A request outside the set is clamped to the nearest
+  // supported value instead of being forwarded into a 400 (#619). Omitted =
+  // forward whatever the client asked for.
+  reasoningEfforts?: readonly ReasoningEffort[];
+  // Output-token floor sent when — and ONLY when — the client omitted
+  // max_tokens entirely (#553). Some providers apply a tiny server-side
+  // default in that case and cut the answer off mid-sentence, which clients
+  // experience as a broken stream rather than as a truncation. A
+  // client-supplied value always wins, larger or smaller. Applied by the
+  // adapters through resolveMaxTokens(), so a platform added here only takes
+  // effect once its adapter routes max_tokens through that helper
+  // (openai-compat + cloudflare already do).
+  defaultMaxTokens?: number;
 }
 
 // Keyed by Platform (not string) so a typo'd platform id fails tsc instead of
@@ -124,26 +224,41 @@ export interface PlatformParamPolicy {
 // boundary since routes carry platform ids as plain strings.
 export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPolicy>> = {
   // Mistral's API is strict (422 on unknown body keys) and names its seed
-  // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents.
+  // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents, and
+  // no reasoning_effort (Magistral's reasoning has no request-side knob).
   mistral: {
-    drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'],
+    drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'],
     rename: { seed: 'random_seed' },
   },
   // Groq documents logprobs / top_logprobs / logit_bias as unsupported and
   // rejects requests that include them.
   groq: { drop: ['logprobs', 'top_logprobs', 'logit_bias'] },
   // GitHub Models sits on Azure OpenAI, which 400s "Unrecognized request
-  // argument" for knobs outside the OpenAI set.
-  github: { drop: ['top_k', 'min_p', 'repetition_penalty'] },
+  // argument" for knobs outside the OpenAI set. Its reasoning_effort enum is
+  // the older low/medium/high one, so 'none'/'minimal' are clamped rather
+  // than sent.
+  github: { drop: ['top_k', 'min_p', 'repetition_penalty'], reasoningEfforts: ['low', 'medium', 'high'] },
   // Gemini's generationConfig has no equivalents for these; the adapter
-  // translates the rest natively (topK, seed, penalties, responseSchema).
+  // translates the rest natively (topK, seed, penalties, responseSchema, and
+  // reasoning_effort → thinkingConfig — see toGeminiExtendedConfig).
   google: { drop: ['min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'] },
   // Cohere's OpenAI-compat endpoint covers seed/penalties/response_format;
-  // the rest have no mapping there.
-  cohere: { drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs'] },
+  // the rest (incl. reasoning_effort — Cohere's own knob is a non-OpenAI
+  // `thinking` object) have no mapping there.
+  cohere: { drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'] },
   // Workers AI's OpenAI-compat endpoint parses a known subset; send only what
-  // it understands.
-  cloudflare: { drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs'] },
+  // it understands. It also applies a small server-side max_tokens default
+  // when the request omits one, so an SDK client that never sets max_tokens
+  // (the common case) sees answers stop a couple of seconds in — reported on
+  // @cf/openai/gpt-oss-120b, where the model's own reasoning trace eats the
+  // default before any visible text lands (#553). 8192 is the floor we send
+  // instead: generous for a chat turn plus reasoning, and small enough to fit
+  // inside the smallest context window in the Workers AI catalog (24K on
+  // @cf/meta/llama-3.3-70b-instruct-fp8-fast) with room left for the prompt.
+  cloudflare: {
+    drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'],
+    defaultMaxTokens: 8192,
+  },
   // AI Horde builds its own payload format; none of the extended set maps.
   aihorde: { drop: [...EXTENDED_SAMPLING_KEYS] },
   // Kilo's anonymous gateway 400s ("Provider returned error") whenever
@@ -183,9 +298,30 @@ export function extendedBodyParams(platform: string, options: ExtendedSamplingOp
         && (value as { type?: string }).type === 'json_object') {
       value = ANY_OBJECT_SCHEMA;
     }
+    if (key === 'reasoning_effort' && policy?.reasoningEfforts) {
+      value = clampEffortTo(value as ReasoningEffort, policy.reasoningEfforts);
+      if (value === undefined) continue;
+    }
     out[policy?.rename?.[key] ?? key] = value;
   }
   return out;
+}
+
+/** The output-token floor this platform sends for a request that carries no
+ *  max_tokens at all, or undefined when the provider's own default is fine. */
+export function defaultMaxTokensFor(platform: string): number | undefined {
+  return PLATFORM_PARAM_POLICIES[platform as Platform]?.defaultMaxTokens;
+}
+
+/**
+ * The max_tokens to put on the wire for one request: whatever the client asked
+ * for, or the platform's floor when the client asked for nothing (#553).
+ * Never clamps — a client-set value passes through untouched in both
+ * directions, and the gateway's own guardrails (token budget, routing reserve)
+ * have already had their say by the time an adapter calls this.
+ */
+export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
+  return requested ?? defaultMaxTokensFor(platform);
 }
 
 /** True when this platform's policy strips response_format before send — the

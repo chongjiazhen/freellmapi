@@ -56,16 +56,35 @@ export const DEFAULT_STRATEGY: RoutingStrategy = 'balanced';
 export const PRIOR_SUCCESS = 1;
 export const PRIOR_FAILURE = 1;
 
-export function reliabilityPosterior(successes: number, failures: number): { alpha: number; beta: number } {
+/** Community-sourced prior counts, folded into the Beta posterior as the
+ *  starting balance (#685 follow-up). `successes`/`failures` are the
+ *  decay-weighted LOCAL sample counts; the community numbers are the
+ *  aggregated, de-poisoned counts from other instances. Local samples dilute
+ *  the community prior automatically: the more this install has observed, the
+ *  less the shared starting point matters. */
+export interface CommunityReliabilityPrior {
+  successes: number;
+  failures: number;
+}
+
+export function reliabilityPosterior(
+  successes: number,
+  failures: number,
+  community?: CommunityReliabilityPrior,
+): { alpha: number; beta: number } {
   return {
-    alpha: Math.max(0, successes) + PRIOR_SUCCESS,
-    beta: Math.max(0, failures) + PRIOR_FAILURE,
+    alpha: Math.max(0, successes) + (community?.successes ?? 0) + PRIOR_SUCCESS,
+    beta: Math.max(0, failures) + (community?.failures ?? 0) + PRIOR_FAILURE,
   };
 }
 
 // Deterministic expected reliability — used for the dashboard display score.
-export function expectedReliability(successes: number, failures: number): number {
-  const { alpha, beta } = reliabilityPosterior(successes, failures);
+export function expectedReliability(
+  successes: number,
+  failures: number,
+  community?: CommunityReliabilityPrior,
+): number {
+  const { alpha, beta } = reliabilityPosterior(successes, failures, community);
   return alpha / (alpha + beta);
 }
 
@@ -106,8 +125,74 @@ export function speedScore(tokPerSec: number, ttfbMs: number | null): number {
   return THROUGHPUT_WEIGHT * tp + TTFB_WEIGHT * ttfbScore(ttfbMs);
 }
 
+// ── Speed: what a timeout costs (#619) ──────────────────────────────────────
+// A request that times out IS the model being slow — the reporter's exact
+// complaint: a relay model that hangs on half its calls loses reliability but
+// used to keep a pristine speed number, because the analytics query fed the
+// speed axis from `status = 'success'` rows ONLY. So a timeout now contributes
+// to the speed window as what it actually was: its wall-clock latency with ZERO
+// output tokens (dragging throughput down) and that same latency as its
+// first-byte time (which lands past TTFB_WORST_MS, i.e. no latency credit).
+//
+// Capped, because `latency_ms` on a timed-out row is unbounded — a provider
+// that holds a socket open for twenty minutes, or a per-platform
+// PROVIDER_TIMEOUT override in the hundreds of seconds, would otherwise let a
+// single hang dominate the whole 7-day window and flatten the axis for every
+// model on that platform. Two minutes is above the built-in per-attempt HTTP
+// deadline and the 90s stream-stall watchdog, so a normal timeout is counted in
+// full and only genuine outliers are clipped.
+export const TIMEOUT_LATENCY_CAP_MS = 120_000;
+
+// ── Observed speed rank ─────────────────────────────────────────────────────
+// `models.speed_rank` is the catalog's hand-assigned "how fast is this model"
+// ordering (1 = fastest; the shipped catalog spans 1..11) and it drives the
+// dashboard's sort-by-speed preset. Until now nothing ever wrote it at runtime,
+// so it stayed frozen at whatever the seed said no matter how the model
+// actually behaved (#619). observedSpeedRank projects the live [0,1] speed axis
+// back onto that same low-is-fast scale so an observed rank is directly
+// comparable with a catalog one.
+export const OBSERVED_SPEED_RANK_BEST = 1;
+export const OBSERVED_SPEED_RANK_WORST = 10;
+
+export function observedSpeedRank(speed: number): number {
+  const s = Math.min(1, Math.max(0, Number.isFinite(speed) ? speed : 0));
+  const span = OBSERVED_SPEED_RANK_WORST - OBSERVED_SPEED_RANK_BEST;
+  return OBSERVED_SPEED_RANK_BEST + Math.round((1 - s) * span);
+}
+
 // ── Intelligence ────────────────────────────────────────────────────────────
-// Caller supplies a composite (tier-first, rank-as-tiebreaker — see router) and
+// `size_label` is the CROSS-PROVIDER capability tier (issue #135 — a seeded
+// intelligence_rank is only calibrated within one provider's own catalog), so
+// tier still dominates and no rank can promote a model past the tier above it.
+// Inside a tier, though, rank is no longer a near-invisible tiebreak: it now
+// has a real, visible effect on the composite ACROSS providers by design, so
+// that a user's rank edit actually moves the axis and the routing order
+// (#673). A label we don't recognize scores below every real tier, which is
+// also why a model seeded with a placeholder label can never win an
+// auto-route (#488).
+export const TIER_VALUE: Record<string, number> = { Frontier: 4, Large: 3, Medium: 2, Small: 1 };
+
+export function tierValue(sizeLabel: string): number {
+  return TIER_VALUE[sizeLabel] ?? 0;
+}
+
+// Rank is 1..1000 with 1 = best. A LINEAR rank term made the axis effectively
+// blind to user edits (#673): tier*1000 dwarfed the rank, and the chain-level
+// min-max normalization diluted a few-rank-point change to well under a
+// displayed percentage point, so "set the intelligence rank to a better
+// number" looked like it did nothing. Compress the rank with a square root so
+// edits near the top of the range (1 vs 3 vs 10) are visible on the axis and
+// in routing, while the tier keeps strict dominance: the worst rank in a tier
+// (sqrt(1000)*31 ≈ 980 < 1000) still beats the best rank of the tier below.
+const RANK_SCALE = 31;
+
+export function intelligenceComposite(sizeLabel: string, intelligenceRank: number): number {
+  // tier*1000 keeps tiers strictly separated; -sqrt(rank)*RANK_SCALE prefers
+  // lower rank in-tier but lets rank edits move the axis (see #673).
+  return tierValue(sizeLabel) * 1000 - Math.sqrt(Math.max(1, intelligenceRank)) * RANK_SCALE;
+}
+
+// Caller supplies a composite (tier-first, sqrt-compressed rank — see above) and
 // the min/max across the enabled chain. We min-max normalize to [0,1], 1 = best.
 export function intelligenceScore(composite: number, min: number, max: number): number {
   if (max <= min) return 1; // single model or all equal → neutral-high

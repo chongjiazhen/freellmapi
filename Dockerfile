@@ -17,6 +17,7 @@ COPY package.json package-lock.json ./
 COPY shared/package.json ./shared/
 COPY server/package.json ./server/
 COPY client/package.json ./client/
+COPY cli/package.json ./cli/
 
 RUN npm ci
 
@@ -33,6 +34,7 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3001
+ENV FREELLMAPI_INSTALL_METHOD=docker
 
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
@@ -43,10 +45,19 @@ COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/server/node_modules ./server/node_modules
 COPY --from=build --chown=node:node /app/shared ./shared
 COPY --from=build --chown=node:node /app/server/package.json ./server/package.json
+# The dashboard shows which RELEASE this is, and the release version lives in
+# desktop/package.json (server/package.json tracks the workspace, not the app).
+# One 400-byte manifest so a container install can name its own version (#703).
+COPY --from=build --chown=node:node /app/desktop/package.json ./desktop/package.json
 COPY --from=build --chown=node:node /app/server/dist ./server/dist
 COPY --from=build --chown=node:node /app/client/dist ./client/dist
 
 RUN mkdir -p /app/server/data && chown -R node:node /app/server/data
+
+# Deliberately last of the runtime layers: the SHA changes on every commit, and
+# an ARG/ENV above the COPYs invalidates the cache for all of them on each build.
+ARG FREELLMAPI_COMMIT_SHA
+ENV FREELLMAPI_COMMIT_SHA=${FREELLMAPI_COMMIT_SHA}
 
 USER node
 

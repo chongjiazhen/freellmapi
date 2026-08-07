@@ -6,18 +6,28 @@ import {
   canUseTokens,
   isOnCooldown,
   canUseProvider,
+  canUseProviderMinute,
   canUseProviderTokens,
+  canUseKeyConcurrency,
+  acquireLease,
+  releaseLease,
   getSoonestCooldownExpiry,
 } from './ratelimit.js';
 import {
   BANDIT_PRESETS, DEFAULT_STRATEGY, type RoutingStrategy, type RoutingWeights,
   reliabilityPosterior, expectedReliability, sampleBeta,
-  speedScore, intelligenceScore, headroomFactor, rateLimitFactor, combineScore,
+  speedScore, intelligenceScore, intelligenceComposite, headroomFactor, rateLimitFactor, combineScore,
+  observedSpeedRank, TIMEOUT_LATENCY_CAP_MS,
 } from './scoring.js';
+import { TIMEOUT_ERROR_MARKERS } from '../lib/error-classify.js';
+import { modelsWithOverriddenField } from './model-state.js';
 import { parseBudget } from '../lib/budget.js';
 import { platformDropsResponseFormat } from '../lib/sampling-params.js';
-import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from './model-groups.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from './model-groups.js';
 import { getActiveProfileId } from './profile-models.js';
+import { customEndpointKeyIds } from './custom-endpoint.js';
+import { modelStatsKey, endpointScopeForBaseUrl } from '../lib/endpoint-scope.js';
+import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { Db } from '../db/types.js';
@@ -108,6 +118,9 @@ interface KeyRow {
   status: string;
   enabled: number;
   base_url: string | null;
+  // Optional JSON array of model_id strings this key may serve; NULL = every
+  // model of its platform (#657).
+  model_scope_json: string | null;
 }
 
 // Chain row joined with the model fields the bandit needs to score it.
@@ -131,6 +144,19 @@ export interface ChainRow {
   // Custom models bind to the api_keys row carrying their endpoint (#212);
   // NULL for built-in platforms.
   key_id: number | null;
+  // The endpoint this row belongs to ('' for catalog platforms). Two relays can
+  // each hold a row for the same model_id, and everything scored or rate-limited
+  // per model has to tell them apart (#651).
+  endpoint_scope: string;
+  /**
+   * Ordering TIER, ahead of score. 0 (the default, and what every other chain
+   * builder produces) is a normal candidate. A higher number is a fallback that
+   * may only serve once every lower tier is exhausted, however good its live
+   * numbers are — currently set only for a member reached through a group's
+   * auto-derived slug rather than the model id the client actually wrote, where
+   * answering on score alone would be a silent substitution (#651).
+   */
+  match_tier?: number;
 }
 
 export interface RouteResult {
@@ -141,10 +167,30 @@ export interface RouteResult {
   keyId: number;
   platform: string;
   displayName: string;
+  /**
+   * The custom endpoint this route belongs to, '' for catalog platforms (#651).
+   * Carried on the route so the failure path can attribute a retirement signal
+   * to ONE relay instead of every relay serving the same model id.
+   */
+  endpointScope: string;
   // Daily limits for this model, so a 429 handler can tell a genuine daily
   // exhaustion (escalate the cooldown) from a transient per-minute spike.
   rpdLimit: number | null;
   tpdLimit: number | null;
+  /**
+   * Frees the in-flight lease taken when this route was selected. Idempotent.
+   *
+   * Callers should invoke it once the attempt is finished, however it finished —
+   * the shared fallback loop does so from a `finally` so no exit path can leak.
+   *
+   * Optional, and every call site uses `release?.()`, for a specific reason: the
+   * invocation sits in a `finally`, and a TypeError thrown there would *replace*
+   * the in-flight provider exception with a useless one, turning a diagnosable
+   * 429 into a mystery 500. A route that arrives without it (a test double, a
+   * future construction path) should quietly fall back to the lease ageing out
+   * rather than destroy the error being propagated.
+   */
+  release?: () => void;
 }
 
 // ── Routing token estimate: cap the reserved OUTPUT, not the full max_tokens ──
@@ -250,6 +296,18 @@ export function getAllPenalties(): Array<{ modelDbId: number; count: number; pen
 // ── Routing strategy (persisted) ────────────────────────────────────────────
 const STRATEGY_KEY = 'routing_strategy';
 const CUSTOM_WEIGHTS_KEY = 'routing_custom_weights';
+const EXPLORE_KEY = 'routing_explore_enabled';
+const COMMUNITY_PRIOR_KEY = 'routing_community_prior';
+const COMMUNITY_PRIOR_ENABLED_KEY = 'routing_community_prior_enabled';
+
+/** Chance per request that an unmeasured model gets tried first when the
+ *  exploration toggle is on. The bandit's Thompson sampling already explores
+ *  automatically; this guarantees a floor so models with no reliability/speed
+ *  data still get sampled instead of being starved by prior-heavy rivals. */
+export const EXPLORE_CHANCE = 0.1;
+/** A model counts as "has data" once its decay-weighted success+failure
+ *  pseudo-count reaches this many samples. */
+export const EXPLORE_MIN_SAMPLES = 5;
 const VALID_STRATEGIES: RoutingStrategy[] = ['priority', 'balanced', 'smartest', 'fastest', 'reliable', 'custom'];
 
 export function getRoutingStrategy(): RoutingStrategy {
@@ -264,6 +322,18 @@ export function setRoutingStrategy(strategy: RoutingStrategy): void {
     throw new Error(`Unknown routing strategy: ${strategy}`);
   }
   setSetting(STRATEGY_KEY, strategy);
+}
+
+// ── Exploration toggle (persisted) ─────────────────────────────────────────
+// Off by default: existing routing behavior unchanged. When on, routeRequest
+// gives unmeasured models a guaranteed chance to be tried (EXPLORE_CHANCE) so
+// they acquire reliability/speed samples instead of losing every bandit draw.
+export function getExploreEnabled(): boolean {
+  return getSetting(EXPLORE_KEY) === '1';
+}
+
+export function setExploreEnabled(enabled: boolean): void {
+  setSetting(EXPLORE_KEY, enabled ? '1' : '0');
 }
 
 // ── Custom weights (persisted) ──────────────────────────────────────────────
@@ -303,6 +373,112 @@ export function setCustomWeights(weights: RoutingWeights): void {
   }));
 }
 
+// ── Community reliability prior (persisted) ────────────────────────────────
+// Aggregated, de-poisoned counts from other self-hosted instances, folded into
+// the Beta posterior as a starting balance so a brand-new model isn't blind
+// (#685 follow-up). Keyed "platform:model_id" (endpoint-scoped keys use the
+// same modelStatsKey form). Local samples dilute it automatically.
+//
+// Opt-in: priors only reach the posterior when routing_community_prior_enabled
+// is on (default off). Server-side only for now — there is deliberately no
+// ingestion path yet, so the flag pins the opt-in semantics before one lands.
+type CommunityPriorMap = Record<string, { successes: number; failures: number }>;
+
+/** Ceiling on a single prior's effective sample size. Local counts are
+ *  decay-weighted (2-day half-life — a busy install still only carries on the
+ *  order of a hundred effective samples), so an unbounded, undecayed community
+ *  count would drown local evidence forever and collapse the Thompson-sampling
+ *  variance to zero. Capping at ~50 pseudo-observations keeps a prior worth
+ *  roughly half the local evidence at most: enough to seed a brand-new model,
+ *  cheap for real local traffic to override. */
+export const COMMUNITY_PRIOR_MAX_SAMPLES = 50;
+
+/** Validate a raw prior map and cap each entry's effective sample size.
+ *  Shared by the read path and the write path so a value is bounded no matter
+ *  how it entered (fresh set, legacy stored blob, hand-edited settings row).
+ *  Invalid entries (negative, all-zero, no ':') are dropped; oversized ones
+ *  are rescaled preserving the success/failure ratio (980/20 → 49/1). */
+function sanitizeCommunityPriors(priors: unknown): CommunityPriorMap {
+  const clean: CommunityPriorMap = {};
+  if (!priors || typeof priors !== 'object') return clean;
+  for (const [key, v] of Object.entries(priors as Record<string, { successes: number; failures: number }>)) {
+    if (
+      key.includes(':') &&
+      v && typeof v === 'object' &&
+      Number.isFinite(v.successes) && v.successes >= 0 &&
+      Number.isFinite(v.failures) && v.failures >= 0 &&
+      v.successes + v.failures > 0
+    ) {
+      const total = v.successes + v.failures;
+      const scale = total > COMMUNITY_PRIOR_MAX_SAMPLES ? COMMUNITY_PRIOR_MAX_SAMPLES / total : 1;
+      const entry = { successes: Math.round(v.successes * scale), failures: Math.round(v.failures * scale) };
+      if (entry.successes + entry.failures > 0) clean[key] = entry;
+    }
+  }
+  return clean;
+}
+
+// Parsed-prior cache, same 60s shape as the stats cache: routing reads the map
+// once per chain entry (and once per key in orderKeysByScore), so hitting
+// sqlite + JSON.parse on every lookup is pure waste. Invalidated by the two
+// setters and by refreshStatsCache, so tests and future ingestion see writes
+// immediately.
+let communityPriorCache: { map: CommunityPriorMap; enabled: boolean } | null = null;
+let communityPriorCacheTime = 0;
+
+function communityPriorState(): { map: CommunityPriorMap; enabled: boolean } {
+  const now = Date.now();
+  if (communityPriorCache && now - communityPriorCacheTime < CACHE_TTL_MS) return communityPriorCache;
+  let map: CommunityPriorMap = {};
+  const raw = getSetting(COMMUNITY_PRIOR_KEY);
+  if (raw) {
+    try {
+      map = sanitizeCommunityPriors(JSON.parse(raw));
+    } catch { /* corrupt setting → no priors */ }
+  }
+  communityPriorCache = { map, enabled: getSetting(COMMUNITY_PRIOR_ENABLED_KEY) === '1' };
+  communityPriorCacheTime = now;
+  return communityPriorCache;
+}
+
+function invalidateCommunityPriorCache(): void {
+  communityPriorCache = null;
+}
+
+/** Whether stored community priors are folded into the posterior. Default off. */
+export function getCommunityPriorEnabled(): boolean {
+  return communityPriorState().enabled;
+}
+
+export function setCommunityPriorEnabled(enabled: boolean): void {
+  setSetting(COMMUNITY_PRIOR_ENABLED_KEY, enabled ? '1' : '0');
+  invalidateCommunityPriorCache();
+}
+
+/** Community prior for one model, or undefined when none is stored.
+ *  Raw read — ignores the enabled flag; routing goes through
+ *  activeCommunityPrior, which honors it. */
+export function getCommunityPrior(platform: string, modelId: string, endpointScope?: string):
+  { successes: number; failures: number } | undefined {
+  return communityPriorState().map[modelStatsKey(platform, modelId, endpointScope)];
+}
+
+/** Gated read for routing: undefined unless the opt-in flag is on. */
+function activeCommunityPrior(platform: string, modelId: string, endpointScope?: string):
+  { successes: number; failures: number } | undefined {
+  const state = communityPriorState();
+  return state.enabled ? state.map[modelStatsKey(platform, modelId, endpointScope)] : undefined;
+}
+
+/** Replace the whole community-prior map (e.g. after an aggregation fetch).
+ *  Invalid entries are dropped and oversized ones capped, never stored raw. */
+export function setCommunityPriors(priors: CommunityPriorMap): number {
+  const clean = sanitizeCommunityPriors(priors);
+  setSetting(COMMUNITY_PRIOR_KEY, JSON.stringify(clean));
+  invalidateCommunityPriorCache();
+  return Object.keys(clean).length;
+}
+
 function weightsFor(strategy: RoutingStrategy): RoutingWeights | null {
   if (strategy === 'priority') return null;
   if (strategy === 'custom') return getCustomWeights();
@@ -322,65 +498,150 @@ const CACHE_TTL_MS = 60 * 1000;
 interface ModelStats {
   successes: number;   // decay-weighted pseudo-count
   failures: number;    // decay-weighted pseudo-count
-  tokPerSec: number;   // from successful requests only (0 = no data)
+  // Output tokens from successes over the time spent on successes AND timeouts
+  // (#619 — see the accumulator below); 0 = no data.
+  tokPerSec: number;
   avgTtfbMs: number | null; // null = no first-byte timing yet
   monthlyUsedTokens: number; // calendar-month usage, for the headroom guardrail
+  // Decay-weighted requests that actually SAY something about speed: successes
+  // plus timeouts. A model can have hundreds of 401s and still no speed signal,
+  // so this — not successes + failures — is what gates the observed speed_rank
+  // writeback.
+  speedSamples: number;
 }
 
+// Per-key slice of the same window (#580): reliability/speed observed through
+// ONE credential of a model. With unified groups, a model's traffic can span
+// several keys whose real quality diverges (expired, quota-drained, region-
+// blocked keys fail while siblings are fine) — the rolled-up model bucket
+// can't see that, so key selection needs its own buckets.
+interface KeyStats {
+  successes: number;   // decay-weighted pseudo-count
+  failures: number;    // decay-weighted pseudo-count
+  tokPerSec: number;   // from successful requests only (0 = no data)
+  avgTtfbMs: number | null;
+}
+
+// Keyed by modelStatsKey(): "platform:model_id" for catalog models, and
+// "custom:model_id@base_url" for a relay model that carries an endpoint scope
+// (#651). A single-endpoint install produces the same keys it always did.
 let statsCache: Map<string, ModelStats> | null = null;
+let keyStatsCache: Map<string, KeyStats> | null = null; // "platform:model_id:key_id"
 let statsCacheTime = 0;
 
 function decayWeight(ageDays: number): number {
   return Math.pow(0.5, Math.max(0, ageDays) / HALF_LIFE_DAYS);
 }
 
+// SQL predicate for "this row is a timed-out request" (#619). A timeout is an
+// error row whose text carries one of the shared timeout markers
+// (lib/error-classify.ts), which is also what the failover attempt trail
+// classifies on. 'canceled' rows (#752 — client hung up) never reach this
+// predicate: the stats query below filters them out entirely, because a
+// vanished client says nothing about the model's reliability or speed. The
+// markers are hard-coded lowercase identifiers from our own source, never
+// user input, so interpolating them into the LIKE list is safe.
+const IS_TIMEOUT_SQL = `(status != 'success' AND (${
+  TIMEOUT_ERROR_MARKERS.map(m => `LOWER(COALESCE(error, '')) LIKE '%${m}%'`).join(' OR ')
+}))`;
+
+/** api_keys.id → endpoint scope, for every custom credential on record (#651). */
+function customEndpointScopes(db: Db): Map<number, string> {
+  const rows = db.prepare("SELECT id, base_url FROM api_keys WHERE platform = 'custom'")
+    .all() as { id: number; base_url: string | null }[];
+  return new Map(rows.map(r => [r.id, endpointScopeForBaseUrl(r.base_url)]));
+}
+
 export function refreshStatsCache(db: Db, force = false): void {
   if (!force && statsCache && Date.now() - statsCacheTime < CACHE_TTL_MS) return;
 
+  // Re-read the community priors alongside the stats they season, so a forced
+  // refresh (tests, admin actions) never routes on a stale prior snapshot.
+  invalidateCommunityPriorCache();
+
   const since = new Date(Date.now() - WINDOW_MS).toISOString();
+  // Grouped by (model, key, day age): still a handful of rows per model — key
+  // count × ≤7 day buckets — so the finer grain keeps the same one-query,
+  // 60s-cached shape. Aggregated two ways below: rolled up per model (ordering)
+  // and per key (in-model key selection, #580).
   const buckets = db.prepare(`
-    SELECT platform, model_id,
+    SELECT platform, model_id, key_id,
       CAST((julianday('now') - julianday(created_at)) AS INTEGER) AS age_days,
       COUNT(*) AS total,
       SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
       SUM(CASE WHEN status = 'success' THEN output_tokens ELSE 0 END) AS succ_out,
       SUM(CASE WHEN status = 'success' THEN latency_ms ELSE 0 END) AS succ_lat,
       SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN ttfb_ms ELSE 0 END) AS succ_ttfb_sum,
-      SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt
+      SUM(CASE WHEN status = 'success' AND ttfb_ms IS NOT NULL THEN 1 ELSE 0 END) AS succ_ttfb_cnt,
+      SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN 1 ELSE 0 END) AS timeouts,
+      SUM(CASE WHEN ${IS_TIMEOUT_SQL} THEN MIN(MAX(latency_ms, 0), ${TIMEOUT_LATENCY_CAP_MS}) ELSE 0 END) AS timeout_lat
     FROM requests
-    WHERE created_at >= ?
-    GROUP BY platform, model_id, age_days
+    WHERE created_at >= ? AND status <> 'canceled'
+    GROUP BY platform, model_id, key_id, age_days
   `).all(since) as Array<{
-    platform: string; model_id: string; age_days: number; total: number; successes: number;
+    platform: string; model_id: string; key_id: number | null; age_days: number; total: number; successes: number;
     succ_out: number; succ_lat: number; succ_ttfb_sum: number; succ_ttfb_cnt: number;
+    timeouts: number; timeout_lat: number;
   }>;
 
-  // Accumulate decay-weighted sums per model.
-  const acc = new Map<string, {
-    wSucc: number; wFail: number; wOut: number; wLat: number; wTtfbSum: number; wTtfbCnt: number;
-  }>();
-  for (const b of buckets) {
-    const key = `${b.platform}:${b.model_id}`;
-    const w = decayWeight(b.age_days);
-    const a = acc.get(key) ?? { wSucc: 0, wFail: 0, wOut: 0, wLat: 0, wTtfbSum: 0, wTtfbCnt: 0 };
+  // Accumulate decay-weighted sums per model AND per key.
+  //
+  // Timeouts (#619) land in the SAME latency/TTFB accumulators as successes,
+  // because that is what they are: time spent, nothing produced. Each one adds
+  // its capped wall-clock latency to the throughput denominator with zero
+  // output tokens, and that same figure as a first-byte sample — which is past
+  // TTFB_WORST_MS, so it scores no latency credit. Net effect: a model that
+  // times out constantly can no longer keep a stellar speed number just because
+  // its handful of successes were quick.
+  interface Acc { wSucc: number; wFail: number; wOut: number; wLat: number; wTtfbSum: number; wTtfbCnt: number; wTimeouts: number }
+  const emptyAcc = (): Acc => ({ wSucc: 0, wFail: 0, wOut: 0, wLat: 0, wTtfbSum: 0, wTtfbCnt: 0, wTimeouts: 0 });
+  const addBucket = (a: Acc, w: number, b: (typeof buckets)[number]): void => {
     a.wSucc += w * b.successes;
     a.wFail += w * (b.total - b.successes);
     a.wOut += w * b.succ_out;
-    a.wLat += w * b.succ_lat;
-    a.wTtfbSum += w * b.succ_ttfb_sum;
-    a.wTtfbCnt += w * b.succ_ttfb_cnt;
-    acc.set(key, a);
+    a.wLat += w * (b.succ_lat + b.timeout_lat);
+    a.wTtfbSum += w * (b.succ_ttfb_sum + b.timeout_lat);
+    a.wTtfbCnt += w * (b.succ_ttfb_cnt + b.timeouts);
+    a.wTimeouts += w * b.timeouts;
+  };
+  // Which endpoint each custom credential belongs to, so a request logged
+  // against relay A's key lands in relay A's bucket and nowhere else (#651).
+  // `requests` has always recorded key_id, so pre-migration history splits
+  // correctly too; rows whose key is gone (or that never had one) fall into the
+  // un-scoped bucket, which only un-scoped rows read.
+  const scopeByKeyId = customEndpointScopes(db);
+  const scopeOf = (platform: string, keyId: number | null): string =>
+    platform === 'custom' && keyId != null ? (scopeByKeyId.get(keyId) ?? '') : '';
+
+  const acc = new Map<string, Acc>();
+  const keyAcc = new Map<string, Acc>();
+  for (const b of buckets) {
+    const key = modelStatsKey(b.platform, b.model_id, scopeOf(b.platform, b.key_id));
+    const w = decayWeight(b.age_days);
+    let a = acc.get(key);
+    if (!a) acc.set(key, a = emptyAcc());
+    addBucket(a, w, b);
+    if (b.key_id != null) {
+      const kk = `${key}:${b.key_id}`;
+      let ka = keyAcc.get(kk);
+      if (!ka) keyAcc.set(kk, ka = emptyAcc());
+      addBucket(ka, w, b);
+    }
   }
 
   // Calendar-month token usage per model, for the headroom guardrail.
   const usageRows = db.prepare(`
-    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+    SELECT platform, model_id, key_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
     FROM requests
     WHERE created_at >= datetime('now', 'start of month')
       AND request_type = 'chat'
-    GROUP BY platform, model_id
-  `).all() as Array<{ platform: string; model_id: string; used: number }>;
-  const usageMap = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
+    GROUP BY platform, model_id, key_id
+  `).all() as Array<{ platform: string; model_id: string; key_id: number | null; used: number }>;
+  const usageMap = new Map<string, number>();
+  for (const r of usageRows) {
+    const key = modelStatsKey(r.platform, r.model_id, scopeOf(r.platform, r.key_id));
+    usageMap.set(key, (usageMap.get(key) ?? 0) + r.used);
+  }
 
   const next = new Map<string, ModelStats>();
   for (const [key, a] of acc) {
@@ -390,28 +651,109 @@ export function refreshStatsCache(db: Db, force = false): void {
       tokPerSec: a.wLat > 0 ? (a.wOut * 1000) / a.wLat : 0,
       avgTtfbMs: a.wTtfbCnt > 0 ? a.wTtfbSum / a.wTtfbCnt : null,
       monthlyUsedTokens: usageMap.get(key) ?? 0,
+      speedSamples: a.wSucc + a.wTimeouts,
     });
   }
   // Models with month usage but no recent window data still need a headroom number.
   for (const [key, used] of usageMap) {
     if (!next.has(key)) {
-      next.set(key, { successes: 0, failures: 0, tokPerSec: 0, avgTtfbMs: null, monthlyUsedTokens: used });
+      next.set(key, { successes: 0, failures: 0, tokPerSec: 0, avgTtfbMs: null, monthlyUsedTokens: used, speedSamples: 0 });
     }
   }
 
+  const nextKeys = new Map<string, KeyStats>();
+  for (const [kk, a] of keyAcc) {
+    nextKeys.set(kk, {
+      successes: a.wSucc,
+      failures: a.wFail,
+      tokPerSec: a.wLat > 0 ? (a.wOut * 1000) / a.wLat : 0,
+      avgTtfbMs: a.wTtfbCnt > 0 ? a.wTtfbSum / a.wTtfbCnt : null,
+    });
+  }
+
   statsCache = next;
+  keyStatsCache = nextKeys;
   statsCacheTime = Date.now();
+
+  // Natural tail of a recompute: fold what we just measured back into
+  // models.speed_rank (#619). Never allowed to break routing — the caches above
+  // are already published, and a failed write just means the column keeps its
+  // previous value until the next pass.
+  if (Date.now() - speedRankWriteTime >= SPEED_RANK_WRITE_INTERVAL_MS) {
+    speedRankWriteTime = Date.now();
+    try {
+      writeObservedSpeedRanks(db);
+    } catch (e) {
+      console.error('Failed to write observed speed ranks:', e);
+    }
+  }
 }
 
-// Composite intelligence: size_label is the cross-provider capability tier
-// (issue #135 — intelligence_rank is only meaningful within one provider), so
-// tier dominates and intelligence_rank breaks ties inside a tier.
-const TIER_VALUE: Record<string, number> = { Frontier: 4, Large: 3, Medium: 2, Small: 1 };
-function intelligenceComposite(sizeLabel: string, intelligenceRank: number): number {
-  const tier = TIER_VALUE[sizeLabel] ?? 0;
-  // tier*1000 keeps tiers strictly separated; -rank prefers lower rank in-tier.
-  return tier * 1000 - intelligenceRank;
+// ── Observed speed_rank writeback (#619) ────────────────────────────────────
+// models.speed_rank is the catalog's hand-assigned speed ordering and drives
+// the dashboard's sort-by-speed preset. It was only ever WRITTEN by the seed
+// migrations, catalog sync, and an explicit user override — never by anything
+// that had actually watched the model run, so a relay model that hangs on half
+// its calls kept whatever rank the catalog guessed for it forever.
+//
+// This folds the live speed axis back into the column, under three rules:
+//   - a model needs SPEED_RANK_MIN_SAMPLES decay-weighted speed-bearing
+//     requests (successes + timeouts) before we claim to know anything; below
+//     that it keeps its catalog value;
+//   - a user-set speed_rank override always wins — we skip those models
+//     entirely rather than fight applyModelOverrides for the column;
+//   - the UPDATE is guarded on the value actually changing, so a steady system
+//     writes nothing at all.
+//
+// A catalog sync re-stamps speed_rank from the catalog; the next pass simply
+// re-derives the observed value, which is why this is a periodic write rather
+// than a one-shot migration.
+export const SPEED_RANK_MIN_SAMPLES = 20;
+const SPEED_RANK_WRITE_INTERVAL_MS = 10 * 60 * 1000;
+let speedRankWriteTime = 0;
+
+/** Test hook: forget when the last writeback ran so the next refresh does one. */
+export function resetSpeedRankWriteback(): void {
+  speedRankWriteTime = 0;
 }
+
+/**
+ * Write an observed speed rank for every model with enough recent samples and
+ * no user-set speed_rank override. Returns how many rows actually changed.
+ * Reads the stats cache as-is — callers refresh it first (refreshStatsCache
+ * calls this from its own tail).
+ */
+export function writeObservedSpeedRanks(db: Db): number {
+  if (!statsCache || statsCache.size === 0) return 0;
+
+  const pinned = modelsWithOverriddenField(db, 'speedRank');
+  const rows = db.prepare('SELECT id, platform, model_id, speed_rank, endpoint_scope FROM models')
+    .all() as { id: number; platform: string; model_id: string; speed_rank: number; endpoint_scope: string }[];
+
+  const update = db.prepare('UPDATE models SET speed_rank = ? WHERE id = ?');
+  let written = 0;
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      // Overrides are keyed (platform, model_id) — they only exist for
+      // catalog-managed rows, which are never endpoint-scoped — while the
+      // measured stats are per endpoint, so each relay's copy gets its own
+      // observed rank instead of one shared number (#651).
+      if (pinned.has(`${row.platform}:${row.model_id}`)) continue;
+      const stats = statsCache!.get(modelStatsKey(row.platform, row.model_id, row.endpoint_scope));
+      if (!stats || stats.speedSamples < SPEED_RANK_MIN_SAMPLES) continue;
+      const rank = observedSpeedRank(speedScore(stats.tokPerSec, stats.avgTtfbMs));
+      if (rank === row.speed_rank) continue;
+      update.run(rank, row.id);
+      written++;
+    }
+  });
+  tx();
+  return written;
+}
+
+// Composite intelligence (tier-first, rank-as-tiebreaker) lives in scoring.ts
+// so the seeding path can reason about the same tier ladder the router scores
+// on — see intelligenceComposite there.
 
 // Per-model axis values + the final score. `sampled` chooses Thompson sampling
 // (for routing) vs. the expected value (for a stable dashboard display).
@@ -443,16 +785,17 @@ function scoreChainEntry(
   sampled: boolean,
   keyCounts: Map<string, number>,
 ): ScoredEntry {
-  const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+  const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
   const successes = stats?.successes ?? 0;
   const failures = stats?.failures ?? 0;
 
+  const community = activeCommunityPrior(entry.platform, entry.model_id, entry.endpoint_scope);
   let reliability: number;
   if (sampled) {
-    const { alpha, beta } = reliabilityPosterior(successes, failures);
+    const { alpha, beta } = reliabilityPosterior(successes, failures, community);
     reliability = sampleBeta(alpha, beta);
   } else {
-    reliability = expectedReliability(successes, failures);
+    reliability = expectedReliability(successes, failures, community);
   }
 
   const speed = speedScore(stats?.tokPerSec ?? 0, stats?.avgTtfbMs ?? null);
@@ -485,12 +828,16 @@ function scoreChainEntry(
  * request. Priority mode is deterministic either way.
  */
 function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): ChainRow[] {
+  // Tier first, always: it is the one ordering input that score must not be able
+  // to override (see ChainRow.match_tier). Zero for every chain built anywhere
+  // else, so this is a no-op outside slug-fallback resolution.
+  const tier = (e: ChainRow) => e.match_tier ?? 0;
   const weights = weightsFor(strategy);
   if (!weights) {
     // Legacy priority mode: base priority + 429 penalty, ascending.
     return chain
       .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) }))
-      .sort((a, b) => a.eff - b.eff || a.e.priority - b.e.priority)
+      .sort((a, b) => tier(a.e) - tier(b.e) || a.eff - b.eff || a.e.priority - b.e.priority)
       .map(x => x.e);
   }
 
@@ -501,8 +848,9 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
 
   return chain
     .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score }))
-    // Higher score first; manual priority breaks ties so the chain still matters.
-    .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority)
+    // Higher score first WITHIN a tier; manual priority breaks ties so the chain
+    // still matters.
+    .sort((a, b) => tier(a.e) - tier(b.e) || b.s - a.s || a.e.priority - b.e.priority)
     .map(x => x.e);
 }
 
@@ -543,7 +891,7 @@ function getActiveChain(db: Db): ChainRow[] {
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
       FROM profile_models pm
       JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
       WHERE pm.profile_id = ?
@@ -558,7 +906,7 @@ function getActiveChain(db: Db): ChainRow[] {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id
+           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     ORDER BY fc.priority ASC
@@ -574,7 +922,7 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id
+           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
     FROM profile_models pm
     JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
     WHERE pm.profile_id = ?
@@ -583,15 +931,25 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
 }
 
 function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
+  // A global sort ignores the chain's ORDER, not its enable flags: a model the
+  // operator switched off — in the catalog or just for auto routing — stays off
+  // here too (#634). Models with no chain row yet (fresh catalog rows) default
+  // to in, so the sort still spans the whole catalog.
+  const profileId = getActiveProfileId(db);
+  const chainEnabled = profileId != null
+    ? 'COALESCE(pm.enabled, fc.enabled, 1) = 1'
+    : 'COALESCE(fc.enabled, 1) = 1';
   const allEnabled = db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id
+           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
     FROM models m
-    WHERE m.enabled = 1
-  `).all() as ChainRow[];
+    LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
+    ${profileId != null ? 'LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id' : ''}
+    WHERE m.enabled = 1 AND ${chainEnabled}
+  `).all(...(profileId != null ? [profileId] : [])) as ChainRow[];
 
   const strategyMap: Record<string, RoutingStrategy> = {
     'smart': 'smartest',
@@ -650,16 +1008,49 @@ export function resolveRoutingChain(modelString: string | undefined): ResolvedCh
   return { chain, strategyKey: `auto:${suffix}` };
 }
 
+// Weights for the in-model key score (#580). Reliability dominates: the point
+// of per-key stats is catching a credential that FAILS (expired, drained,
+// region-blocked); speed differences between keys of the same platform+model
+// are second-order (account-tier throttling) but still worth a nudge.
+const KEY_SCORE_WEIGHTS = { reliability: 0.75, speed: 0.25 };
+
+/**
+ * Order a model's candidate keys by a Thompson-sampled per-key score, mirroring
+ * orderChain's bandit: reliability is a fresh draw from each key's Beta
+ * posterior (so exploration is automatic and proportional to uncertainty — a
+ * key with no data samples from the uniform prior and still gets traffic),
+ * speed is deterministic. Returns null when NO key has recorded data, telling
+ * the caller to keep the legacy round-robin rotation (no signal → no ranking).
+ */
+function orderKeysByScore(entry: ChainRow, keys: KeyRow[]): KeyRow[] | null {
+  if (keys.length < 2 || !keyStatsCache) return null;
+  const prefix = `${modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope)}:`;
+  if (!keys.some(k => keyStatsCache!.has(prefix + k.id))) return null;
+
+  // The prior is per-model, not per-key: look it up once outside the loop.
+  const community = activeCommunityPrior(entry.platform, entry.model_id, entry.endpoint_scope);
+  return keys
+    .map(k => {
+      const stats = keyStatsCache!.get(prefix + k.id);
+      const { alpha, beta } = reliabilityPosterior(stats?.successes ?? 0, stats?.failures ?? 0, community);
+      const rel = sampleBeta(alpha, beta);
+      const spd = speedScore(stats?.tokPerSec ?? 0, stats?.avgTtfbMs ?? null);
+      return { k, s: KEY_SCORE_WEIGHTS.reliability * rel + KEY_SCORE_WEIGHTS.speed * spd };
+    })
+    .sort((a, b) => b.s - a.s || a.k.id - b.k.id)
+    .map(x => x.k);
+}
+
 /**
  * Pick a usable key for ONE model and build its RouteResult, or return null if
  * the model has no key that can serve the request right now (all cooled down,
- * over quota, undecryptable, or no provider). This is the per-model key
- * round-robin previously inlined in routeRequest, factored out so the fusion
- * panel can HARD-PIN a model: rotate across that model's keys without ever
+ * over quota, undecryptable, or no provider). Factored out of routeRequest so
+ * the fusion panel can HARD-PIN a model: walk that model's keys without ever
  * falling through to a different model (issue #326 — soft preference collapses
- * panel diversity under rate limits). Request-level filters (vision/tools/
- * context window) stay in the caller; this only does key selection + accounting
- * pre-checks.
+ * panel diversity under rate limits). Keys are tried in per-key bandit-score
+ * order when any of them has recorded data (#580), else round-robin.
+ * Request-level filters (vision/tools/context window) stay in the caller; this
+ * only does key selection + accounting pre-checks.
  */
 function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: Set<string>, diag?: string[]): RouteResult | null {
   const db = getDb();
@@ -671,11 +1062,21 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   }
   const provider = getProvider(entry.platform as Platform)!;
 
-  const keys = db.prepare(
+  const allKeys = db.prepare(
     "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
   ).all(entry.platform) as KeyRow[];
-  if (keys.length === 0) {
+  if (allKeys.length === 0) {
     diag?.push(`${label}: no enabled+healthy key for platform`);
+    return null;
+  }
+
+  // Scoped keys (#657) are dropped before the walk: a key whose model scope
+  // excludes this model is not a candidate at all — it neither takes a
+  // round-robin slot nor burns an attempt on a guaranteed 403. Parsed once per
+  // key row.
+  const keys = allKeys.filter(k => scopeAllows(parseModelScope(k.model_scope_json), entry.model_id));
+  if (keys.length === 0) {
+    diag?.push(`${label}: no usable key — ${allKeys.length} key(s) scoped to other models`);
     return null;
   }
 
@@ -691,22 +1092,45 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     tpd: entry.tpd_limit,
   };
 
-  const rrKey = `${entry.platform}:${entry.model_id}`;
+  // Score-ordered walk over this model's keys (#580): when any key has recorded
+  // reliability/speed data, try them best-sampled-score first so a chronically
+  // failing key stops soaking up every Nth request. The stats cache is the same
+  // 60s-TTL aggregate the model-level bandit uses (refresh is a no-op when
+  // fresh, and cheap when not). With no data at all, keep the legacy rotation.
+  refreshStatsCache(db);
+  // Scoped so two relays offering the same model id don't share one rotation
+  // cursor over the platform's key list (#651).
+  const rrKey = modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope);
   let idx = roundRobinIndex.get(rrKey) ?? 0;
+  const ranked = orderKeysByScore(entry, keys);
+
+  // A custom model belongs to exactly one endpoint (#212), but an endpoint can
+  // hold several credentials — so the pool is every key on the same base_url,
+  // rotated like any other platform's keys (#619). Legacy rows (key_id NULL)
+  // keep the old any-key match.
+  const endpointKeyIds = entry.platform === 'custom' && entry.key_id != null
+    ? customEndpointKeyIds(db, entry.key_id)
+    : null;
 
   for (let attempt = 0; attempt < keys.length; attempt++) {
-    const key = keys[idx % keys.length];
+    const key = ranked ? ranked[attempt] : keys[idx % keys.length];
     idx++;
 
-    // A custom model belongs to exactly one endpoint (#212); legacy rows
-    // (key_id NULL) keep the old any-key match.
-    if (entry.platform === 'custom' && entry.key_id != null && key.id !== entry.key_id) { note('custom-key-mismatch'); continue; }
+    if (endpointKeyIds && !endpointKeyIds.has(key.id)) { note('custom-key-mismatch'); continue; }
 
     const skipId = `${entry.platform}:${entry.model_id}:${key.id}`;
     if (skipKeys?.has(skipId)) { note('already-failed-this-request'); continue; }
 
     if (isOnCooldown(entry.platform, entry.model_id, key.id)) { note('cooldown'); continue; }
     if (!canUseProvider(entry.platform, key.id)) { note('provider-daily-cap'); continue; }
+    // Account-wide per-minute budget, checked before the per-model gates: a model
+    // with a NULL rpm_limit would otherwise sail past them and spend a budget its
+    // siblings share.
+    if (!canUseProviderMinute(entry.platform, key.id)) { note('provider-minute-cap'); continue; }
+    // Skip a key that already has its allowed requests in the air. Without this,
+    // parallel streams all pick the same key and 429 each other on providers that
+    // meter concurrency per credential.
+    if (!canUseKeyConcurrency(entry.platform, key.id)) { note('key-concurrency'); continue; }
     if (!canMakeRequest(entry.platform, entry.model_id, key.id, limits)) { note('rpm/rpd-limit'); continue; }
     if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) { note('tpm/tpd-limit'); continue; }
     if (!canUseProviderTokens(entry.platform, key.id, entry.model_id, estimatedTokens)) { note('provider-daily-token-cap'); continue; }
@@ -727,6 +1151,9 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     if (!resolvedProvider) { note('no-resolved-provider'); continue; }
 
     roundRobinIndex.set(rrKey, idx);
+    // Taken only once the key has cleared every gate and is definitely being
+    // returned, so a rejected candidate never consumes concurrency budget.
+    const leaseId = acquireLease(entry.platform, entry.model_id, key.id, estimatedTokens);
     return {
       provider: resolvedProvider,
       modelId: entry.model_id,
@@ -735,8 +1162,10 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
       keyId: key.id,
       platform: entry.platform,
       displayName: entry.display_name,
+      endpointScope: entry.endpoint_scope ?? '',
       rpdLimit: limits.rpd,
       tpdLimit: limits.tpd,
+      release: () => releaseLease(leaseId),
     };
   }
 
@@ -777,17 +1206,25 @@ export function hasOtherUsableKey(modelDbId: number, excludingKeyId: number, ski
 
   const limits = { rpm: m.rpm_limit, rpd: m.rpd_limit, tpm: m.tpm_limit, tpd: m.tpd_limit };
   const keys = db.prepare(
-    "SELECT id FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all(m.platform) as { id: number }[];
+    "SELECT id, model_scope_json FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all(m.platform) as { id: number; model_scope_json: string | null }[];
+
+  // Keys of the model's own custom endpoint (#212, #619); a key belonging to a
+  // DIFFERENT endpoint cannot serve it, so it doesn't count as an alternative.
+  const endpointKeyIds = m.platform === 'custom' && m.key_id != null
+    ? customEndpointKeyIds(db, m.key_id)
+    : null;
 
   for (const k of keys) {
     if (k.id === excludingKeyId) continue;
-    // A custom model binds to exactly one endpoint key (#212); a sibling custom
-    // key cannot serve it, so it doesn't count as an alternative.
-    if (m.platform === 'custom' && m.key_id != null && k.id !== m.key_id) continue;
+    if (endpointKeyIds && !endpointKeyIds.has(k.id)) continue;
+    // A sibling scoped away from this model can never serve it (#657) — counting
+    // it would wrongly suppress the model-level penalty this gate exists for.
+    if (!scopeAllows(parseModelScope(k.model_scope_json), m.model_id)) continue;
     if (skipKeys?.has(`${m.platform}:${m.model_id}:${k.id}`)) continue;
     if (isOnCooldown(m.platform, m.model_id, k.id)) continue;
     if (!canUseProvider(m.platform, k.id)) continue;
+    if (!canUseProviderMinute(m.platform, k.id)) continue;
     if (!canMakeRequest(m.platform, m.model_id, k.id, limits)) continue;
     // A per-minute token spike on the failed key doesn't mean a fresh key lacks
     // headroom; a nominal 1-token probe only rules out a key already at its
@@ -808,7 +1245,7 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id
+           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
     FROM models m
     WHERE m.id = ? AND m.enabled = 1
   `).get(modelDbId) as ChainRow | undefined;
@@ -844,7 +1281,17 @@ export function routePinnedModel(modelDbId: number, estimatedTokens = 1000, skip
  * preferred-model injection in routeRequest would unshift an off-group model and
  * the pin would no longer be strict (it could answer with a different model).
  */
-export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
+export function resolveModelGroupCandidates(
+  memberDbIds: number[],
+  /**
+   * Members that were reached only through a group's auto-derived slug, not the
+   * id the client wrote (#651). They stay in the chain — resolution must never
+   * shrink — but as a strictly lower tier, so they can serve only once every
+   * literal match is exhausted. Omit it and every row is an equal candidate,
+   * which is what every other caller wants.
+   */
+  demotedDbIds?: ReadonlySet<number>,
+): ChainRow[] {
   const db = getDb();
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
@@ -857,7 +1304,7 @@ export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
       FROM models m
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
       WHERE m.id = ? AND m.enabled = 1
@@ -868,7 +1315,7 @@ export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id
+             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
       FROM models m
       LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
@@ -878,7 +1325,9 @@ export function resolveModelGroupCandidates(memberDbIds: number[]): ChainRow[] {
   const rows: ChainRow[] = [];
   for (const id of memberDbIds) {
     const row = (activeProfileId == null ? selectMember.get(id) : selectMember.get(activeProfileId, id)) as ChainRow | undefined;
-    if (row) rows.push(row);
+    if (!row) continue;
+    row.match_tier = demotedDbIds?.has(id) ? 1 : 0;
+    rows.push(row);
   }
   return orderChain(rows, strategy);
 }
@@ -924,12 +1373,15 @@ export function getOrderedFusionChain(estimatedTokens: number): FusionCandidate[
   // misleading "no available key for model". Passing a placeholder token count
   // here made both size gates no-ops.
   const usableKeys = db.prepare(
-    "SELECT id, platform FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown')"
-  ).all() as { id: number; platform: string }[];
-  const keysByPlatform = new Map<string, number[]>();
+    "SELECT id, platform, model_scope_json FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown')"
+  ).all() as { id: number; platform: string; model_scope_json: string | null }[];
+  // Scope parsed once per key row (#657); the servable filter below re-checks
+  // membership per model.
+  const keysByPlatform = new Map<string, { id: number; scope: Set<string> | null }[]>();
   for (const k of usableKeys) {
+    const entry = { id: k.id, scope: parseModelScope(k.model_scope_json) };
     const arr = keysByPlatform.get(k.platform);
-    if (arr) arr.push(k.id); else keysByPlatform.set(k.platform, [k.id]);
+    if (arr) arr.push(entry); else keysByPlatform.set(k.platform, [entry]);
   }
   const servable = chain.filter(e => {
     // A null context_window means "unknown", not "zero": same convention the
@@ -937,11 +1389,17 @@ export function getOrderedFusionChain(estimatedTokens: number): FusionCandidate[
     if (e.context_window != null && estimatedTokens > e.context_window) return false;
     const keyIds = keysByPlatform.get(e.platform);
     if (!keyIds) return false;
+    // Same endpoint-pool rule the router applies (#619).
+    const endpointKeyIds = e.platform === 'custom' && e.key_id != null
+      ? customEndpointKeyIds(db, e.key_id)
+      : null;
     const limits = { rpm: e.rpm_limit, rpd: e.rpd_limit, tpm: e.tpm_limit, tpd: e.tpd_limit };
-    return keyIds.some(kid =>
-      (e.key_id == null || kid === e.key_id) &&
+    return keyIds.some(({ id: kid, scope }) =>
+      scopeAllows(scope, e.model_id) &&
+      (endpointKeyIds == null || endpointKeyIds.has(kid)) &&
       !isOnCooldown(e.platform, e.model_id, kid) &&
       canUseProvider(e.platform, kid) &&
+      canUseProviderMinute(e.platform, kid) &&
       canMakeRequest(e.platform, e.model_id, kid, limits) &&
       canUseProviderTokens(e.platform, kid, e.model_id, estimatedTokens),
     );
@@ -997,9 +1455,9 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   // saved fusion configs that use canonical ids keep working. Exact model_id
   // match above always wins first, so OFF mode and legacy configs are untouched.
   if (isUnifyEnabled()) {
-    const members = resolveRequestedIdToMembers(modelId, getModelGroups());
-    if (members && members.length > 0) {
-      const top = resolveModelGroupCandidates(members)[0];
+    const resolved = resolveRequestedIdForDispatch(modelId, getModelGroups());
+    if (resolved && resolved.memberDbIds.length > 0) {
+      const top = resolveModelGroupCandidates(resolved.memberDbIds, resolved.demotedDbIds)[0];
       if (top) {
         return {
           modelDbId: top.model_db_id,
@@ -1026,6 +1484,27 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
   const sortedChain = orderChain(chain, strategy);
 
+  // Exploration toggle (#685/#707 follow-up): when enabled, give a model with
+  // no reliability/speed samples a guaranteed chance to be tried, so it stops
+  // losing every bandit draw to prior-heavy rivals. With EXPLORE_CHANCE
+  // probability, pick one unmeasured model uniformly and try it first; if it
+  // fails, the loop falls through to the scored order as usual. Only for
+  // bandit strategies — Manual is the operator's explicit order.
+  if (strategy !== 'priority' && getExploreEnabled() && Math.random() < EXPLORE_CHANCE) {
+    const unmeasured = sortedChain.filter(e => {
+      const stats = statsCache?.get(modelStatsKey(e.platform, e.model_id, e.endpoint_scope));
+      return (stats?.successes ?? 0) + (stats?.failures ?? 0) < EXPLORE_MIN_SAMPLES;
+    });
+    if (unmeasured.length > 0) {
+      const probe = unmeasured[Math.floor(Math.random() * unmeasured.length)];
+      const idx = sortedChain.findIndex(e => e.model_db_id === probe.model_db_id);
+      if (idx > 0) {
+        const [probeRow] = sortedChain.splice(idx, 1);
+        sortedChain.unshift(probeRow);
+      }
+    }
+  }
+
   // Sticky session / Explicit pinning: move preferred model to front of chain
   if (preferredModelDbId) {
     const idx = sortedChain.findIndex(e => e.model_db_id === preferredModelDbId);
@@ -1043,7 +1522,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
                m.platform, m.model_id, m.display_name, m.intelligence_rank,
                m.size_label, m.monthly_token_budget,
                m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-               m.supports_tools, m.context_window, m.key_id
+               m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
         FROM models m
         WHERE m.id = ? AND m.enabled = 1
       `).get(preferredModelDbId) as ChainRow | undefined;
@@ -1137,7 +1616,7 @@ export interface RoutingScore {
   totalRequests: number; // decay-weighted observations
 }
 
-export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; scores: RoutingScore[] } {
+export function getRoutingScores(): { strategy: RoutingStrategy; weights: RoutingWeights | null; customWeights: RoutingWeights; exploreEnabled: boolean; scores: RoutingScore[] } {
   const db = getDb();
   const strategy = getRoutingStrategy();
   refreshStatsCache(db);
@@ -1154,7 +1633,7 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
 
   const scores: RoutingScore[] = chain.map(entry => {
     const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts);
-    const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
+    const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
     return {
       modelDbId: entry.model_db_id,
       platform: entry.platform,
@@ -1175,7 +1654,31 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
   // so the dashboard's custom-weight sliders can render even before the user
   // has saved their own — distinct from `weights`, which is null in priority
   // mode and the active preset otherwise.
-  return { strategy, weights: weightsFor(strategy), customWeights: getCustomWeights(), scores };
+  // exploreEnabled must ride along here too: the dashboard checkbox renders
+  // from GET /routing, so omitting it would make the toggle look permanently
+  // off (and impossible to turn off) after a refetch.
+  return { strategy, weights: weightsFor(strategy), customWeights: getCustomWeights(), exploreEnabled: getExploreEnabled(), scores };
+}
+
+/**
+ * Filter a sticky-session pin down to something still routable (#634).
+ *
+ * A sticky entry holds a model db id for up to 30 minutes, so it goes stale the
+ * moment the operator disables that model — in the catalog, or just for auto
+ * routing. It must NOT be handed to routeRequest as-is: an off-chain preferred
+ * id is treated as an explicit pin and injected ahead of the chain, which is
+ * right for a client that named the model and wrong for a pin the client never
+ * asked for. Dropping it here falls the request through to normal auto routing.
+ *
+ * Pass the same chain the request will route over (the prefetched auto chain);
+ * omit it to check the active chain, which is what routeRequest would use.
+ */
+export function resolveStickyPreference(stickyModelDbId: number | undefined, chain?: ChainRow[]): number | undefined {
+  if (stickyModelDbId == null) return undefined;
+  const rows = chain ?? getActiveChain(getDb());
+  return rows.some(entry => entry.model_db_id === stickyModelDbId && entry.enabled)
+    ? stickyModelDbId
+    : undefined;
 }
 
 // Whether at least one vision-capable model is enabled in the fallback chain.

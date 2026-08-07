@@ -154,7 +154,11 @@ describe('GoogleProvider', () => {
     expect(capturedBody.contents[0].role).toBe('user');
   });
 
-  it('folds system prompts into user content and strips function tools for Gemma models (#500)', async () => {
+  // #500: older Gemma on the Gemini API 400s with "Developer instruction is not
+  // enabled" — system prompts must keep folding into the first user turn.
+  // #582: tools must NOT be stripped anymore (Gemma 4 has native function
+  // calling); the fold and tool pass-through coexist on the same request.
+  it('folds system prompts into user content for Gemma models while passing tools through (#500, #582)', async () => {
     let capturedBody: any;
     vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
       capturedBody = JSON.parse((init as any).body);
@@ -188,11 +192,108 @@ describe('GoogleProvider', () => {
       },
     );
 
+    // The #500 fold is untouched: no systemInstruction, system text leads contents.
     expect(capturedBody.systemInstruction).toBeUndefined();
-    expect(capturedBody.tools).toBeUndefined();
-    expect(capturedBody.toolConfig).toBeUndefined();
     expect(capturedBody.contents[0]).toEqual({ role: 'user', parts: [{ text: 'You are helpful' }] });
     expect(capturedBody.contents[1]).toEqual({ role: 'user', parts: [{ text: 'Hi' }] });
+    // The #582 fix: tools reach Gemma instead of being silently deleted.
+    expect(capturedBody.tools[0].functionDeclarations[0].name).toBe('get_weather');
+    expect(capturedBody.toolConfig.functionCallingConfig.mode).toBe('AUTO');
+  });
+
+  it('passes tools/tool_choice through for Gemma on the streaming path (#582)', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          const encoder = new TextEncoder();
+          controller.enqueue(encoder.encode('data: {"candidates":[{"content":{"parts":[{"functionCall":{"id":"call_1","name":"get_weather","args":{"city":"Karachi"}}}]}}]}\n\n'));
+          controller.enqueue(encoder.encode('data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}\n\n'));
+          controller.close();
+        },
+      });
+      return { ok: true, body: stream } as any;
+    });
+
+    const chunks: any[] = [];
+    for await (const c of provider.streamChatCompletion(
+      'test-key',
+      [{ role: 'user', content: 'Weather?' }],
+      'gemma-4-31b-it',
+      {
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get weather for a city',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        }],
+        tool_choice: 'required',
+      },
+    )) chunks.push(c);
+
+    expect(capturedBody.tools[0].functionDeclarations[0].name).toBe('get_weather');
+    expect(capturedBody.toolConfig.functionCallingConfig.mode).toBe('ANY');
+    const toolDeltas = chunks.flatMap(c => c.choices[0].delta.tool_calls ?? []);
+    expect(toolDeltas).toHaveLength(1);
+    expect(toolDeltas[0].function.name).toBe('get_weather');
+    expect(chunks[chunks.length - 1].choices[0].finish_reason).toBe('tool_calls');
+  });
+
+  it('keeps functionCall/functionResponse history for Gemma multi-turn tool round-trips (#582)', async () => {
+    let capturedBody: any;
+    vi.spyOn(global, 'fetch').mockImplementation(async (_url, init) => {
+      capturedBody = JSON.parse((init as any).body);
+      return {
+        ok: true,
+        json: () => Promise.resolve({
+          candidates: [{ content: { parts: [{ text: 'Sunny, 31C.' }] }, finishReason: 'STOP' }],
+          usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+        }),
+      } as any;
+    });
+
+    await provider.chatCompletion(
+      'test-key',
+      [
+        { role: 'system', content: 'You are helpful' },
+        { role: 'user', content: 'Weather in Karachi?' },
+        {
+          role: 'assistant',
+          content: null,
+          tool_calls: [{
+            id: 'call_gemma_1',
+            type: 'function',
+            function: { name: 'get_weather', arguments: '{"city":"Karachi"}' },
+          }],
+        },
+        { role: 'tool', tool_call_id: 'call_gemma_1', content: '{"temp": 31}' },
+      ],
+      'gemma-4-31b-it',
+      {
+        tools: [{
+          type: 'function',
+          function: {
+            name: 'get_weather',
+            description: 'Get weather for a city',
+            parameters: { type: 'object', properties: { city: { type: 'string' } } },
+          },
+        }],
+      },
+    );
+
+    // System fold still applies, and the tool round-trip history survives.
+    expect(capturedBody.systemInstruction).toBeUndefined();
+    expect(capturedBody.contents[0]).toEqual({ role: 'user', parts: [{ text: 'You are helpful' }] });
+    const modelEntry = capturedBody.contents.find((c: any) => c.role === 'model');
+    expect(modelEntry.parts[0].functionCall.name).toBe('get_weather');
+    expect(modelEntry.parts[0].functionCall.args).toEqual({ city: 'Karachi' });
+    const responseEntry = capturedBody.contents.find((c: any) =>
+      c.parts.some((p: any) => p.functionResponse));
+    expect(responseEntry.parts[0].functionResponse.name).toBe('get_weather');
+    expect(responseEntry.parts[0].functionResponse.response).toEqual({ temp: 31 });
   });
 
   it('does not expose Gemini thought parts as visible content (#539)', async () => {

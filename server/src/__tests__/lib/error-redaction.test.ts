@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizeProviderErrorMessage } from '../../lib/error-redaction.js';
+import { sanitizeProviderErrorMessage, summarizeAttemptError } from '../../lib/error-redaction.js';
 
 describe('sanitizeProviderErrorMessage', () => {
   it('redacts Bearer tokens', () => {
@@ -40,5 +40,27 @@ describe('sanitizeProviderErrorMessage', () => {
   it('caps message length', () => {
     const out = sanitizeProviderErrorMessage('x '.repeat(400));
     expect(out.length).toBeLessThanOrEqual(240);
+  });
+});
+
+// The short per-attempt error summary stored in request_attempts.error_summary:
+// same redactions as sanitizeProviderErrorMessage, tighter cap (200 chars).
+describe('summarizeAttemptError', () => {
+  it('applies the same secret redactions', () => {
+    const out = summarizeAttemptError('401 rejected: Bearer sk-abc.def-12345 for key gsk_A1b2C3d4E5f6G7h8');
+    expect(out).not.toContain('sk-abc.def-12345');
+    expect(out).not.toContain('gsk_A1b2C3d4E5f6G7h8');
+    expect(out).toContain('Bearer [redacted]');
+  });
+
+  it('caps the summary at 200 characters with an ellipsis', () => {
+    const out = summarizeAttemptError('upstream exploded because ' + 'y '.repeat(300));
+    expect(out.length).toBeLessThanOrEqual(200);
+    expect(out.endsWith('...')).toBe(true);
+  });
+
+  it('leaves ordinary provider prose intact', () => {
+    const msg = '429 Too Many Requests: rate limit reached for llama-3.3-70b, retry in 7m12s';
+    expect(summarizeAttemptError(msg)).toBe(msg);
   });
 });
