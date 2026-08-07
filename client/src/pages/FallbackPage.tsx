@@ -107,7 +107,7 @@ export default function FallbackPage() {
   })
 
   const strategyMutation = useMutation({
-    mutationFn: (payload: { strategy: RoutingStrategy; weights?: RoutingWeights }) =>
+    mutationFn: (payload: { strategy: RoutingStrategy; weights?: RoutingWeights; exploreEnabled?: boolean }) =>
       apiFetch('/api/fallback/routing', { method: 'PUT', body: JSON.stringify(payload) }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] }),
   })
@@ -277,6 +277,26 @@ export default function FallbackPage() {
           <p className="mt-2 text-xs text-muted-foreground">
             {isManual ? t('strategies.modeManualHint') : t('strategies.modeScoreHint')}
           </p>
+
+          {/* Exploration toggle (#685 follow-up): footnote-level on purpose —
+              a niche knob that gives unmeasured models a guaranteed chance to
+              be tried so they build reliability/speed data. Hidden in Manual
+              mode, where routeRequest ignores it. */}
+          {!isManual && (
+            <label className="mt-2 inline-flex items-center gap-2 text-xs text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={routing?.exploreEnabled ?? false}
+                disabled={strategyMutation.isPending}
+                onChange={e => strategyMutation.mutate({ strategy, exploreEnabled: e.target.checked })}
+                className="size-3.5 accent-foreground"
+              />
+              <span>{t('strategies.explore')}</span>
+              <Tooltip text={t('strategies.exploreHint')}>
+                <span className="cursor-help underline decoration-dotted underline-offset-2">?</span>
+              </Tooltip>
+            </label>
+          )}
         </section>
 
         <PenaltyInspector />
@@ -371,7 +391,7 @@ export default function FallbackPage() {
                     <SortableContext items={renderedGroups.map(g => `grp:${g.key}`)} strategy={verticalListSortingStrategy}>
                       <tbody>
                         {renderedGroups.map(g => (
-                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} />
+                          <SortableGroupRow key={g.key} group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} />
                         ))}
                       </tbody>
                     </SortableContext>
@@ -389,7 +409,7 @@ export default function FallbackPage() {
                         onClick={() => navigate(`/models/chat/${encodeURIComponent(g.members[0].canonicalId ?? g.members[0].modelId)}`)}
                         className={`group/row border-b last:border-0 cursor-pointer transition-colors hover:[&>td]:bg-muted/50 [&>td:first-child]:rounded-l-lg [&>td:last-child]:rounded-r-lg ${g.members.some(m => m.enabled) ? '' : 'opacity-50'}`}
                       >
-                        <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} />
+                        <GroupHeaderCells group={g} rank={rankByKey.get(g.key) ?? 0} onToggleGroup={handleGroupToggle} allRows={rows} />
                       </tr>
                     ))}
                   </tbody>

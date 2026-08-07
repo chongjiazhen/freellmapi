@@ -69,8 +69,10 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
   res.json({ keyId, status });
 });
 
-// Check all keys
+// Check all keys. Forced: someone pressed the button and wants an answer about
+// every key now, so the scheduled pass' recency skip and provider spacing (#553)
+// don't apply.
 healthRouter.post('/check-all', async (_req: Request, res: Response) => {
-  await checkAllKeys();
+  await checkAllKeys({ force: true });
   res.json({ success: true });
 });

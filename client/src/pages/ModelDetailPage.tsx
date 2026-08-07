@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router-dom'
 import { ChevronLeft, Merge, Save, Split, Trash2 } from 'lucide-react'
@@ -7,6 +7,7 @@ import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { ConfirmButton } from '@/components/confirm-button'
 import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { CopyButton } from '@/components/copy-button'
 import { TableSkeleton } from '@/components/ui/skeleton'
@@ -16,19 +17,25 @@ import { ModelsTabs } from '@/components/models-tabs'
 import { ModelTableHead, RowContent } from '@/components/model-table'
 import {
   groupQuotaBadge,
-  providerLabel,
+  isMemberSplit,
+  memberEndpointTitle,
+  memberOverrideKey,
+  memberProviderLabel,
+  providerPinId,
+  splitsWithoutMember,
   type FallbackEntry,
   type RoutingData,
   type Row,
 } from '@/lib/routing'
-
-type ModelSettingsPatch = {
-  displayName: string
-  contextWindow: number | null
-  supportsVision: boolean
-  supportsTools: boolean
-  fallbackEnabled: boolean
-}
+import {
+  modelSettingsForm,
+  reviewModelSettings,
+  RANK_MAX,
+  RANK_MIN,
+  SIZE_LABELS,
+  type ModelSettingsPatch,
+  type ModelSettingsSource,
+} from '@/lib/model-settings'
 
 // The persisted unify overrides (see server model-groups.ts). `splits` forces a
 // "platform:model_id" member out of its computed group into its own entry.
@@ -116,25 +123,26 @@ export default function ModelDetailPage() {
   })
 
   const splits = unify?.overrides.splits ?? []
-  const memberKey = (m: Row) => `${m.platform}:${m.modelId}`
-  // The split control for one provider row: offer "keep separate" while the
-  // model is merged with siblings, and "merge back" on a copy that was split
-  // out (it lives on its own page then, so the undo must live there too).
+  // New splits are written against ONE row: an unqualified "platform:modelId"
+  // matches every relay that serves the id, so splitting one relay's card used
+  // to move both (#651). Reading accepts the plain form too, so a split saved
+  // before that is still recognised — and still undoable.
   function splitActionFor(m: Row, memberCount: number): SplitAction | undefined {
     if (!unify) return undefined
-    const isSplit = splits.some(s => s.member === memberKey(m))
-    if (isSplit) {
+    // Checked before the member-count guard on purpose: a split row is usually
+    // ALONE in its group, and that is exactly the row that needs the undo.
+    if (isMemberSplit(splits, m)) {
       return {
         kind: 'undo',
         pending: splitMutation.isPending,
-        onClick: () => splitMutation.mutate(splits.filter(s => s.member !== memberKey(m))),
+        onClick: () => splitMutation.mutate(splitsWithoutMember(splits, m)),
       }
     }
     if (memberCount < 2) return undefined
     return {
       kind: 'split',
       pending: splitMutation.isPending,
-      onClick: () => splitMutation.mutate([...splits, { member: memberKey(m) }]),
+      onClick: () => splitMutation.mutate([...splits, { member: memberOverrideKey(m) }]),
     }
   }
 
@@ -147,6 +155,11 @@ export default function ModelDetailPage() {
     .filter(e => e.keyCount > 0 && (e.canonicalId ?? e.modelId) === canonicalId)
     .map(e => ({ ...(scoreById.get(e.modelDbId) ?? {}), ...e }))
     .sort((a, b) => (isManual ? a.priority - b.priority : (b.score ?? 0) - (a.score ?? 0)))
+  // Endpoint disambiguation keys on (platform, model_id) across EVERY configured
+  // row — a relay whose copy was renamed sits in a DIFFERENT display group, so
+  // `members` is not a complete sibling set and scoping to it would hide the
+  // endpoint exactly when two relays collide (#651).
+  const siblings: Row[] = entries as Row[]
 
   function handleToggle(modelDbId: number, enabled: boolean) {
     saveMutation.mutate(entries.map(e => ({
@@ -208,7 +221,7 @@ export default function ModelDetailPage() {
                 <tbody>
                   {members.map((m, i) => (
                     <tr key={m.modelDbId} className={`border-b last:border-0 ${m.enabled ? '' : 'opacity-50'}`}>
-                      <RowContent row={m} rank={i + 1} draggable={false} onToggle={handleToggle} />
+                      <RowContent row={m} rank={i + 1} draggable={false} onToggle={handleToggle} providerName={memberProviderLabel(m, siblings)} providerTitle={memberEndpointTitle(m, siblings)} />
                     </tr>
                   ))}
                 </tbody>
@@ -225,6 +238,8 @@ export default function ModelDetailPage() {
                   <ProviderSettingsRow
                     key={m.modelDbId}
                     model={m}
+                    endpointLabel={memberProviderLabel(m, siblings)}
+                    endpointTitle={memberEndpointTitle(m, siblings)}
                     saving={modelPatchMutation.isPending && modelPatchMutation.variables?.modelDbId === m.modelDbId}
                     deleting={modelDeleteMutation.isPending && modelDeleteMutation.variables === m.modelDbId}
                     onSave={(patch) => modelPatchMutation.mutate({ modelDbId: m.modelDbId, patch })}
@@ -242,10 +257,12 @@ export default function ModelDetailPage() {
               <div className="space-y-1.5">
                 {members.map(m => (
                   <div key={m.modelDbId} className="flex items-center gap-2 text-xs">
-                    <span className="w-28 shrink-0 text-muted-foreground">{providerLabel(m)}</span>
-                    <code className="min-w-0 flex-1 truncate font-mono text-[11px]">{m.modelId}</code>
+                    <span className="w-28 max-w-[16rem] shrink-0 basis-auto truncate text-muted-foreground sm:w-auto sm:min-w-28" title={memberEndpointTitle(m, siblings)}>
+                      {memberProviderLabel(m, siblings)}
+                    </span>
+                    <code className="min-w-0 flex-1 truncate font-mono text-[11px]">{providerPinId(m, siblings)}</code>
                     <Tooltip text={t('models.copyModelName')}>
-                      <CopyButton text={m.modelId} label={t('models.copyModelName')} className="border-0 bg-transparent" />
+                      <CopyButton text={providerPinId(m, siblings)} label={t('models.copyModelName')} className="border-0 bg-transparent" />
                     </Tooltip>
                   </div>
                 ))}
@@ -269,6 +286,8 @@ export default function ModelDetailPage() {
 
 function ProviderSettingsRow({
   model,
+  endpointLabel,
+  endpointTitle,
   saving,
   deleting,
   onSave,
@@ -276,6 +295,11 @@ function ProviderSettingsRow({
   splitAction,
 }: {
   model: Row
+  // Which provider this card is for. Carries the endpoint too, but only when
+  // two custom endpoints serve the same model id (#651).
+  endpointLabel: string
+  // Hover text for that label, set only when there was a collision to resolve.
+  endpointTitle?: string
   saving: boolean
   deleting: boolean
   onSave: (patch: ModelSettingsPatch) => void
@@ -283,47 +307,39 @@ function ProviderSettingsRow({
   splitAction?: SplitAction
 }) {
   const { t } = useI18n()
-  const [displayName, setDisplayName] = useState(model.displayName)
-  const [contextWindow, setContextWindow] = useState(model.contextWindow ? String(model.contextWindow) : '')
-  const [supportsVision, setSupportsVision] = useState(model.supportsVision)
-  const [supportsTools, setSupportsTools] = useState(model.supportsTools)
-  const [fallbackEnabled, setFallbackEnabled] = useState(model.enabled)
+  // `members` is rebuilt on every render, so depend on the model's own values
+  // rather than the object identity — otherwise the form resets mid-edit.
+  const {
+    modelDbId, displayName, contextWindow, intelligenceRank, speedRank, sizeLabel,
+    rpmLimit, rpdLimit, tpmLimit, tpdLimit, supportsVision, supportsTools, enabled,
+  } = model
+  const source: ModelSettingsSource = useMemo(() => ({
+    displayName, contextWindow, intelligenceRank, speedRank, sizeLabel,
+    rpmLimit, rpdLimit, tpmLimit, tpdLimit, supportsVision, supportsTools, enabled,
+  }), [displayName, contextWindow, intelligenceRank, speedRank, sizeLabel, rpmLimit, rpdLimit,
+    tpmLimit, tpdLimit, supportsVision, supportsTools, enabled])
 
-  useEffect(() => {
-    setDisplayName(model.displayName)
-    setContextWindow(model.contextWindow ? String(model.contextWindow) : '')
-    setSupportsVision(model.supportsVision)
-    setSupportsTools(model.supportsTools)
-    setFallbackEnabled(model.enabled)
-  }, [model.modelDbId, model.displayName, model.contextWindow, model.supportsVision, model.supportsTools, model.enabled])
+  const [form, setForm] = useState(() => modelSettingsForm(source))
+  useEffect(() => setForm(modelSettingsForm(source)), [modelDbId, source])
+  const setField = <K extends keyof typeof form>(key: K, value: typeof form[K]) =>
+    setForm(current => ({ ...current, [key]: value }))
 
-  const parsedContext = contextWindow.trim() === '' ? null : Number(contextWindow)
-  const contextInvalid = parsedContext !== null && (!Number.isInteger(parsedContext) || parsedContext <= 0)
-  const nameInvalid = displayName.trim().length === 0
-  const dirty =
-    displayName.trim() !== model.displayName ||
-    parsedContext !== (model.contextWindow ?? null) ||
-    supportsVision !== model.supportsVision ||
-    supportsTools !== model.supportsTools ||
-    fallbackEnabled !== model.enabled
-  const canSave = dirty && !nameInvalid && !contextInvalid && !saving && !deleting
+  const { patch, invalid, dirty } = reviewModelSettings(source, form)
+  const canSave = dirty && patch !== null && !saving && !deleting
   const sourceLabel = model.source === 'custom' ? t('models.customModel') : t('models.catalogModel')
+  // Fields whose effective value comes from a local override instead of the
+  // catalog. Custom models are never catalog-managed, so this stays empty.
+  const overridden = new Set(model.overrideFields ?? [])
 
   function save() {
-    if (!canSave) return
-    onSave({
-      displayName: displayName.trim(),
-      contextWindow: parsedContext,
-      supportsVision,
-      supportsTools,
-      fallbackEnabled,
-    })
+    if (!canSave || !patch) return
+    onSave(patch)
   }
 
   return (
     <div className="rounded-xl border bg-background/60 p-3">
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <span className="text-xs font-medium">{providerLabel(model)}</span>
+        <span className="text-xs font-medium" title={endpointTitle}>{endpointLabel}</span>
         <code className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{model.modelId}</code>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{sourceLabel}</span>
         {model.hasOverrides && (
@@ -354,36 +370,31 @@ function ProviderSettingsRow({
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_8rem_auto_auto_auto_auto] md:items-end">
         <label className="space-y-1 text-xs text-muted-foreground">
-          <span>{t('models.displayName')}</span>
+          <FieldLabel text={t('models.displayName')} overridden={overridden.has('displayName')} />
           <Input
-            value={displayName}
-            onChange={e => setDisplayName(e.target.value)}
-            aria-invalid={nameInvalid}
+            value={form.displayName}
+            onChange={e => setField('displayName', e.target.value)}
+            aria-invalid={invalid.displayName}
             className="text-sm"
           />
         </label>
-        <label className="space-y-1 text-xs text-muted-foreground">
-          <span>{t('models.contextWindow')}</span>
-          <Input
-            type="number"
-            min={1}
-            step={1}
-            value={contextWindow}
-            onChange={e => setContextWindow(e.target.value)}
-            aria-invalid={contextInvalid}
-            className="text-sm tabular-nums"
-          />
+        <NumberField
+          label={t('models.contextWindow')}
+          value={form.contextWindow}
+          invalid={invalid.contextWindow}
+          overridden={overridden.has('contextWindow')}
+          onChange={value => setField('contextWindow', value)}
+        />
+        <label className="flex h-8 items-center gap-2 text-xs">
+          <Switch size="sm" checked={form.supportsTools} onCheckedChange={value => setField('supportsTools', value)} />
+          <FieldLabel text={t('models.tools')} overridden={overridden.has('supportsTools')} />
         </label>
         <label className="flex h-8 items-center gap-2 text-xs">
-          <Switch size="sm" checked={supportsTools} onCheckedChange={setSupportsTools} />
-          <span>{t('models.tools')}</span>
+          <Switch size="sm" checked={form.supportsVision} onCheckedChange={value => setField('supportsVision', value)} />
+          <FieldLabel text={t('models.vision')} overridden={overridden.has('supportsVision')} />
         </label>
         <label className="flex h-8 items-center gap-2 text-xs">
-          <Switch size="sm" checked={supportsVision} onCheckedChange={setSupportsVision} />
-          <span>{t('models.vision')}</span>
-        </label>
-        <label className="flex h-8 items-center gap-2 text-xs">
-          <Switch size="sm" checked={fallbackEnabled} onCheckedChange={setFallbackEnabled} />
+          <Switch size="sm" checked={form.fallbackEnabled} onCheckedChange={value => setField('fallbackEnabled', value)} />
           <span>{t('models.inFallback')}</span>
         </label>
         <div className="flex items-center justify-end gap-1">
@@ -405,6 +416,136 @@ function ProviderSettingsRow({
           </ConfirmButton>
         </div>
       </div>
+
+      {/* Router inputs: the two ranks feed the scoring axes, the four limits
+          feed rate-limit accounting. Editable because the catalog can be wrong
+          for a given account, or silent about a brand-new model (#551). The
+          capability tier drives the intelligence axis — a custom model without
+          a recognized tier scores 0, so it gets a picker here (#685). */}
+      <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-7">
+        {/* Full-width on the 2/3-column layouts so the six number fields
+            below still tile evenly; one row of seven on desktop. */}
+        <label className="col-span-2 space-y-1 text-xs text-muted-foreground sm:col-span-3 md:col-span-1" title={t('models.sizeLabelHint')}>
+          <FieldLabel text={t('models.sizeLabel')} overridden={overridden.has('sizeLabel')} />
+          <Select value={form.sizeLabel} onValueChange={value => setField('sizeLabel', value ?? '')}>
+            <SelectTrigger className="w-full" aria-label={t('models.sizeLabel')}>
+              <SelectValue placeholder={t('models.sizeLabelNone')} />
+            </SelectTrigger>
+            <SelectContent>
+              {SIZE_LABELS.map(label => (
+                <SelectItem key={label} value={label}>{label}</SelectItem>
+              ))}
+              <SelectItem value="">{t('models.sizeLabelNone')}</SelectItem>
+            </SelectContent>
+          </Select>
+        </label>
+        <NumberField
+          label={t('models.intelligenceRank')}
+          hint={t('models.rankHint')}
+          min={RANK_MIN}
+          max={RANK_MAX}
+          value={form.intelligenceRank}
+          invalid={invalid.intelligenceRank}
+          overridden={overridden.has('intelligenceRank')}
+          onChange={value => setField('intelligenceRank', value)}
+        />
+        <NumberField
+          label={t('models.speedRank')}
+          hint={t('models.rankHint')}
+          min={RANK_MIN}
+          max={RANK_MAX}
+          value={form.speedRank}
+          invalid={invalid.speedRank}
+          overridden={overridden.has('speedRank')}
+          onChange={value => setField('speedRank', value)}
+        />
+        <NumberField
+          label={t('models.limitRpm')}
+          hint={t('models.limitHint')}
+          value={form.rpmLimit}
+          invalid={invalid.rpmLimit}
+          overridden={overridden.has('rpmLimit')}
+          onChange={value => setField('rpmLimit', value)}
+        />
+        <NumberField
+          label={t('models.limitRpd')}
+          hint={t('models.limitHint')}
+          value={form.rpdLimit}
+          invalid={invalid.rpdLimit}
+          overridden={overridden.has('rpdLimit')}
+          onChange={value => setField('rpdLimit', value)}
+        />
+        <NumberField
+          label={t('models.limitTpm')}
+          hint={t('models.limitHint')}
+          value={form.tpmLimit}
+          invalid={invalid.tpmLimit}
+          overridden={overridden.has('tpmLimit')}
+          onChange={value => setField('tpmLimit', value)}
+        />
+        <NumberField
+          label={t('models.limitTpd')}
+          hint={t('models.limitHint')}
+          value={form.tpdLimit}
+          invalid={invalid.tpdLimit}
+          overridden={overridden.has('tpdLimit')}
+          onChange={value => setField('tpdLimit', value)}
+        />
+      </div>
     </div>
+  )
+}
+
+// A field label that says whether the value below it is still the catalog's or
+// has been replaced locally — the same emerald the row-level badge uses.
+function FieldLabel({ text, overridden }: { text: string; overridden: boolean }) {
+  const { t } = useI18n()
+  return (
+    <span className="flex items-center gap-1">
+      {text}
+      {overridden && (
+        <span
+          title={t('models.localOverride')}
+          aria-label={t('models.localOverride')}
+          className="size-1.5 shrink-0 rounded-full bg-emerald-600 dark:bg-emerald-400"
+        />
+      )}
+    </span>
+  )
+}
+
+function NumberField({
+  label,
+  hint,
+  value,
+  invalid,
+  overridden,
+  onChange,
+  min = 1,
+  max,
+}: {
+  label: string
+  hint?: string
+  value: string
+  invalid: boolean
+  overridden: boolean
+  onChange: (value: string) => void
+  min?: number
+  max?: number
+}) {
+  return (
+    <label className="space-y-1 text-xs text-muted-foreground" title={hint}>
+      <FieldLabel text={label} overridden={overridden} />
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={1}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        aria-invalid={invalid}
+        className="text-sm tabular-nums"
+      />
+    </label>
   )
 }

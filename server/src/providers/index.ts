@@ -5,6 +5,8 @@ import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
 import { AIHordeProvider } from './aihorde.js';
+import { ModelScopeProvider } from './modelscope.js';
+import { PollinationsProvider } from './pollinations.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -150,11 +152,11 @@ register(new OpenAICompatProvider({
 // text.pollinations.ai host returned 502 in the July 2026 audit; publishable
 // keys now use the unified gen.pollinations.ai endpoint. Free capacity accrues
 // at one pollen per IP per hour, so chat requires a real publishable key.
-register(new OpenAICompatProvider({
-  platform: 'pollinations',
-  name: 'Pollinations',
-  baseUrl: 'https://gen.pollinations.ai/v1',
-}));
+// Dedicated PollinationsProvider (not plain OpenAICompatProvider) because
+// GET /v1/models is public — it answers 200 for a revoked key — so validation
+// probes the authenticated /account/key instead; see providers/pollinations.ts
+// and issue #608.
+register(new PollinationsProvider());
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access
 // also works for basic models. Wraps a handful of upstream models behind one
@@ -331,6 +333,25 @@ register(new OpenAICompatProvider({
   name: 'SEA-LION',
   baseUrl: 'https://api.sea-lion.ai/v1',
 }));
+
+// ModelScope (魔搭社区, Alibaba) — OpenAI-compatible inference API
+// (api-inference.modelscope.cn/v1, Bearer auth). Free tier: 2000 requests/day
+// account-wide. Token from modelscope.cn/my/myaccesstoken, BUT calls only work
+// after binding the ModelScope account to an Alibaba Cloud CHINA-site (cn)
+// account with Chinese real-name verification — unbound tokens 401 on every
+// call ("please bind your alibaba cloud account before use"). Dedicated
+// ModelScopeProvider (not plain OpenAICompatProvider) because GET /v1/models
+// answers 200 even for garbage tokens, so key validation needs a 1-token chat
+// probe instead — see providers/modelscope.ts.
+//
+// RETIRED-model gotcha (#581): ModelScope answers requests for retired models
+// with `429 insufficient balance (1008)`. isPaymentRequiredError
+// (lib/error-classify.ts) reads "insufficient balance" as out-of-credits and
+// benches the key ~24h — intentionally NOT special-cased in the shared
+// classifier (the string is a genuine payment marker everywhere else). Keep
+// retired ids out of the catalog instead; the quota-header path in
+// provider-quota.ts keys on response headers, never on that message text.
+register(new ModelScopeProvider());
 
 // AI Horde — free, community-powered inference (volunteer workers) via an
 // OpenAI-compatible proxy. Dedicated AIHordeProvider (not OpenAICompatProvider)

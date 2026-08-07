@@ -502,6 +502,9 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'mistral',    name: 'Mistral',       baseUrl: 'https://api.mistral.ai/v1' },
     { platform: 'openrouter', name: 'OpenRouter',    baseUrl: 'https://openrouter.ai/api/v1' },
     { platform: 'github',     name: 'GitHub Models', baseUrl: 'https://models.github.ai/inference' },
+    // pollinations registers a PollinationsProvider subclass (custom
+    // validateKey, see providers/pollinations.test.ts) but chat routing is
+    // stock openai-compat.
     { platform: 'pollinations', name: 'Pollinations', baseUrl: 'https://gen.pollinations.ai/v1' },
     { platform: 'zhipu',      name: 'Zhipu AI',      baseUrl: 'https://open.bigmodel.cn/api/paas/v4' },
     { platform: 'opencode',   name: 'OpenCode Zen',  baseUrl: 'https://opencode.ai/zen/v1' },
@@ -510,6 +513,9 @@ describe('OpenAICompatProvider - platform instances', () => {
     { platform: 'navy',       name: 'NavyAI',        baseUrl: 'https://api.navy/v1' },
     { platform: 'nara',       name: 'NaraRouter',    baseUrl: 'https://router.bynara.id/v1' },
     { platform: 'sealion',    name: 'SEA-LION',      baseUrl: 'https://api.sea-lion.ai/v1' },
+    // modelscope registers a ModelScopeProvider subclass (custom validateKey,
+    // see providers/modelscope.test.ts) but chat routing is stock openai-compat.
+    { platform: 'modelscope', name: 'ModelScope',    baseUrl: 'https://api-inference.modelscope.cn/v1' },
   ] as const;
 
   for (const p of platforms) {

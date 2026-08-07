@@ -9,7 +9,7 @@ import type {
   ChatToolChoice,
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, routingReserveTokens, type RouteResult } from '../services/router.js';
+import { routeRequest, resolveStickyPreference, routingReserveTokens, type RouteResult } from '../services/router.js';
 import { getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -19,6 +19,7 @@ import { isClientAbortError, newClientAbortError } from '../lib/error-classify.j
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
 import type { ReasoningEffort } from '../lib/sampling-params.js';
@@ -93,8 +94,11 @@ const messagesSchema = z.object({
   // reasoning_effort (see effortFromAnthropicThinking) so providers with
   // request-side reasoning control receive it; platforms without support have
   // it stripped by the policy in lib/sampling-params.ts.
+  // `type` is a free string, not the enabled/disabled enum: Anthropic keeps
+  // adding modes (Claude Code sends 'adaptive') and validating the enum here
+  // turned a knob we only use as a hint into a hard 400 (#632).
   thinking: z.object({
-    type: z.enum(['enabled', 'disabled']).optional(),
+    type: z.string().optional(),
     budget_tokens: z.number().int().optional(),
   }).passthrough().nullable().optional(),
 }).passthrough();
@@ -108,8 +112,13 @@ export function effortFromAnthropicThinking(
   thinking: { type?: string; budget_tokens?: number } | null | undefined,
 ): ReasoningEffort | undefined {
   if (!thinking) return undefined;
-  if (thinking.type === 'disabled') return 'none';
+  const type = thinking.type?.trim().toLowerCase();
+  if (type === 'disabled' || type === 'off' || type === 'none') return 'none';
   const budget = thinking.budget_tokens;
+  // Model-managed modes ('adaptive', 'auto') without an explicit budget mean
+  // "you decide how much" — forward no knob at all and let the provider
+  // default stand, same as a -1 Gemini thinking budget.
+  if (budget == null && (type === 'adaptive' || type === 'auto')) return undefined;
   if (budget == null) return 'medium';
   if (budget < 4096) return 'low';
   if (budget < 16384) return 'medium';
@@ -493,7 +502,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const rawSession = req.headers['x-claude-code-session-id'] ?? req.headers['x-session-id'];
   const sessionId = Array.isArray(rawSession) ? rawSession[0] : rawSession;
   let preferredModel = resolved.preferredModelDbId;
-  if (preferredModel == null) preferredModel = getStickyModel(messages, sessionId);
+  if (preferredModel == null) preferredModel = resolveStickyPreference(getStickyModel(messages, sessionId));
 
   // Thin adapter over the shared fallback loop (lib/fallback-loop.ts): the
   // cooldown/skip/penalty/exhaustion machinery is shared, only the Anthropic
@@ -607,7 +616,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         usage: { input_tokens: promptTokens, output_tokens: completionTokens },
       };
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
       res.json(anthropicResponse);
@@ -687,7 +696,7 @@ async function streamCompletion(
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+    res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
     setFallbackHeaders(res, ctx.attempt, ctx.attemptLog);
     writeSse(res, 'message_start', {
       type: 'message_start',

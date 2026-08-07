@@ -347,6 +347,10 @@ export function canUseTokens(
 //   PROVIDER_DAILY_REQUEST_CAP_OPENROUTER=50   (set 0 to disable the cap)
 const DEFAULT_PROVIDER_DAILY_REQUEST_CAPS: Record<string, number> = {
   openrouter: 1000,
+  // ModelScope's free tier is 2000 requests/day across the whole account (all
+  // models share it). 1800 leaves margin for validation probes and for drift
+  // between our ledger and the provider's own daily boundary (#581).
+  modelscope: 1800,
 };
 
 const DEFAULT_PROVIDER_DAILY_TOKEN_CAPS: Record<string, number> = {

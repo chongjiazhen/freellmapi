@@ -4,7 +4,29 @@ import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   LineChart, Line, Legend,
 } from 'recharts'
-import { X } from 'lucide-react'
+import {
+  Activity,
+  ArrowDown,
+  ArrowUp,
+  Bot,
+  ChartLine,
+  CheckCircle2,
+  CircleAlert,
+  CircleDollarSign,
+  Clock,
+  Coins,
+  Gauge,
+  GitBranch,
+  KeyRound,
+  Layers,
+  List,
+  Network,
+  Server,
+  TriangleAlert,
+  Zap,
+  X,
+  type LucideIcon,
+} from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { SegmentedControl } from '@/components/ui/segmented-control'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
@@ -19,6 +41,20 @@ import { platformColors } from '@/lib/routing'
 import { useI18n } from '@/i18n'
 
 type TimeRange = '24h' | '7d' | '30d' | '90d'
+
+const TIME_RANGES: TimeRange[] = ['24h', '7d', '30d', '90d']
+
+// The range toggle sticks: whichever window you last looked at is the one the
+// tab opens with next time, instead of always snapping back to 7d (#711).
+const RANGE_KEY = 'analytics.range'
+
+function storedRange(): TimeRange {
+  try {
+    const v = localStorage.getItem(RANGE_KEY)
+    if (v && (TIME_RANGES as string[]).includes(v)) return v as TimeRange
+  } catch { /* ignore */ }
+  return '7d'
+}
 
 // Response shapes mirror the JSON emitted by server/src/routes/analytics.ts.
 // Latency percentiles and TTFT are null when the raw window is empty (pruned).
@@ -151,7 +187,15 @@ interface RequestDetail extends Omit<RecentCallRow, 'attemptCount'> {
   attempts: RequestAttempt[]
 }
 
-type StatusFilter = 'all' | 'success' | 'error'
+type StatusFilter = 'all' | 'success' | 'error' | 'canceled'
+
+// 'canceled' (#752 — the client hung up mid-request) is neither success nor
+// error: neutral amber, not destructive red.
+function statusTextClass(status: string): string {
+  if (status === 'success') return 'text-muted-foreground'
+  if (status === 'canceled') return 'text-amber-600 dark:text-amber-400'
+  return 'text-destructive'
+}
 
 // First product token of the UA ("python-requests/2.32.3", "curl/8.6.0", …)
 // is enough to tell callers apart in a narrow cell; full string on hover.
@@ -168,10 +212,15 @@ function formatTokens(n?: number): string {
   return String(n)
 }
 
-function Stat({ label, value, hint, className }: { label: string; value: string | number; hint?: string; className?: string }) {
+function Stat({ icon: Icon, label, value, hint, className }: { icon: LucideIcon; label: string; value: string | number; hint?: string; className?: string }) {
   const card = (
     <div className="rounded-3xl border bg-card px-4 py-3">
-      <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-[11px] text-muted-foreground uppercase tracking-wider">{label}</p>
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+          <Icon className="size-3.5" aria-hidden="true" />
+        </span>
+      </div>
       <p className={`text-xl font-semibold tabular-nums mt-1 ${className ?? ''}`}>{value}</p>
     </div>
   )
@@ -180,11 +229,14 @@ function Stat({ label, value, hint, className }: { label: string; value: string 
   return hint ? <HoverTooltip text={hint} side="bottom" className="block">{card}</HoverTooltip> : card
 }
 
-function Panel({ title, actions, children }: { title: string; actions?: React.ReactNode; children: React.ReactNode }) {
+function Panel({ icon: Icon, title, actions, children }: { icon: LucideIcon; title: string; actions?: React.ReactNode; children: React.ReactNode }) {
   return (
     <div className="rounded-3xl border bg-card">
       <div className="px-4 py-3 border-b flex flex-wrap items-center justify-between gap-2">
-        <h3 className="text-sm font-medium">{title}</h3>
+        <h3 className="flex items-center gap-2 text-sm font-medium">
+          <Icon className="size-4 text-muted-foreground" aria-hidden="true" />
+          {title}
+        </h3>
         {actions}
       </div>
       <div className="p-4">{children}</div>
@@ -238,7 +290,10 @@ function RequestDetailDialog({ requestId, onClose }: { requestId: number | null;
     <Dialog open={requestId != null} onOpenChange={(open) => { if (!open) onClose() }}>
       <DialogPopup maxWidth="max-w-2xl">
         <div className="mb-4 flex items-center justify-between gap-4">
-          <DialogTitle>{t('analytics.requestDetailTitle', { id: requestId ?? '' })}</DialogTitle>
+          <div className="flex items-center gap-2">
+            <Activity className="size-4 text-muted-foreground" aria-hidden="true" />
+            <DialogTitle>{t('analytics.requestDetailTitle', { id: requestId ?? '' })}</DialogTitle>
+          </div>
           <DialogClose
             aria-label={t('common.dismiss')}
             className="-mr-1 rounded-lg p-1 text-muted-foreground/70 transition-colors outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50"
@@ -263,7 +318,7 @@ function RequestDetailDialog({ requestId, onClose }: { requestId: number | null;
               <DetailField
                 label={t('common.status')}
                 value={
-                  <span className={detail.status === 'success' ? '' : 'text-destructive'}>{detail.status}</span>
+                  <span className={detail.status === 'success' ? '' : statusTextClass(detail.status)}>{detail.status}</span>
                 }
               />
               <DetailField
@@ -298,7 +353,10 @@ function RequestDetailDialog({ requestId, onClose }: { requestId: number | null;
             )}
 
             <div>
-              <h4 className="text-sm font-medium">{t('analytics.failoverLadder')}</h4>
+              <h4 className="flex items-center gap-2 text-sm font-medium">
+                <GitBranch className="size-4 text-muted-foreground" aria-hidden="true" />
+                {t('analytics.failoverLadder')}
+              </h4>
               <p className="text-xs text-muted-foreground mt-0.5">{t('analytics.failoverLadderHint')}</p>
               {detail.attempts.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-6">{t('analytics.noAttemptTrace')}</p>
@@ -312,7 +370,8 @@ function RequestDetailDialog({ requestId, onClose }: { requestId: number | null;
                         <span className="font-medium">{a.platform}</span>
                         <span className="text-muted-foreground truncate" title={a.modelId}>{a.modelId}</span>
                         <Badge variant="outline">{t('analytics.keyOrdinal', { n: a.keyOrdinal })}</Badge>
-                        <Badge variant={a.outcome === 'ok' || a.outcome === 'committed' ? 'secondary' : 'destructive'}>
+                        {/* client_abort is the caller's doing, not a hop failure. */}
+                        <Badge variant={a.outcome === 'ok' || a.outcome === 'committed' ? 'secondary' : a.outcome === 'client_abort' ? 'outline' : 'destructive'}>
                           {a.outcome}
                         </Badge>
                         <span
@@ -357,7 +416,11 @@ const chartVars = `
 
 export default function AnalyticsPage() {
   const { t } = useI18n()
-  const [range, setRange] = useState<TimeRange>('7d')
+  const [range, setRange] = useState<TimeRange>(storedRange)
+  const updateRange = (r: TimeRange) => {
+    setRange(r)
+    try { localStorage.setItem(RANGE_KEY, r) } catch { /* ignore */ }
+  }
   // Capture "now" once at mount so the savings extrapolation below stays a pure
   // render (calling Date.now() during render is impure and non-deterministic).
   const [now] = useState(() => Date.now())
@@ -486,8 +549,8 @@ export default function AnalyticsPage() {
         actions={
           <SegmentedControl
             value={range}
-            onValueChange={setRange}
-            options={(['24h', '7d', '30d', '90d'] as TimeRange[]).map(r => ({
+            onValueChange={updateRange}
+            options={TIME_RANGES.map(r => ({
               value: r,
               label: t(r === '24h' ? 'analytics.range24h' : r === '7d' ? 'analytics.range7d' : r === '30d' ? 'analytics.range30d' : 'analytics.range90d'),
             }))}
@@ -503,25 +566,25 @@ export default function AnalyticsPage() {
             Array.from({ length: 8 }).map((_, i) => <Skeleton key={i} className="h-[74px] rounded-3xl" />)
           ) : (
             <>
-              <Stat label={t('analytics.requests')} value={summary?.totalRequests ?? 0} hint={requestsHint} />
-              <Stat label={t('analytics.successRate')} value={`${summary?.successRate ?? 0}%`} />
-              <Stat label={t('analytics.inputTokens')} value={formatTokens(summary?.totalInputTokens)} />
-              <Stat label={t('analytics.outputTokens')} value={formatTokens(summary?.totalOutputTokens)} />
-              <Stat label={t('analytics.avgLatency')} value={`${summary?.avgLatencyMs ?? 0} ms`} />
-              <Stat label={t('analytics.p95Latency')} value={p95Value} />
-              <Stat label={t('analytics.avgTtft')} value={ttftValue} />
+              <Stat icon={Activity} label={t('analytics.requests')} value={summary?.totalRequests ?? 0} hint={requestsHint} />
+              <Stat icon={CheckCircle2} label={t('analytics.successRate')} value={`${summary?.successRate ?? 0}%`} />
+              <Stat icon={ArrowDown} label={t('analytics.inputTokens')} value={formatTokens(summary?.totalInputTokens)} />
+              <Stat icon={ArrowUp} label={t('analytics.outputTokens')} value={formatTokens(summary?.totalOutputTokens)} />
+              <Stat icon={Gauge} label={t('analytics.avgLatency')} value={`${summary?.avgLatencyMs ?? 0} ms`} />
+              <Stat icon={Clock} label={t('analytics.p95Latency')} value={p95Value} />
+              <Stat icon={Zap} label={t('analytics.avgTtft')} value={ttftValue} />
               {/* Priced per request at the served model's paid-API equivalent
                   rate (not a flat frontier-model rate) — see db/model-pricing.ts.
                   The value is a 30-day projection; the hover hint tells the whole
                   story (actual period amount + whether it was extrapolated). */}
-              <Stat label={t('analytics.estSavings')} value={`$${savings30d.toFixed(2)}`} hint={savingsHint} />
+              <Stat icon={CircleDollarSign} label={t('analytics.estSavings')} value={`$${savings30d.toFixed(2)}`} hint={savingsHint} />
             </>
           )}
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
           <div className="lg:col-span-2">
-            <Panel title={t('analytics.requestsOverTime')}>
+            <Panel icon={ChartLine} title={t('analytics.requestsOverTime')}>
               {timeline.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
               ) : (
@@ -542,7 +605,7 @@ export default function AnalyticsPage() {
 
           {/* Tokens over time: input vs output, one axis, two-series legend. */}
           <div className="lg:col-span-2">
-            <Panel title={t('analytics.tokensOverTime')}>
+            <Panel icon={Coins} title={t('analytics.tokensOverTime')}>
               {timeline.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
               ) : (
@@ -561,7 +624,7 @@ export default function AnalyticsPage() {
             </Panel>
           </div>
 
-          <Panel title={t('analytics.requestsByProvider')}>
+          <Panel icon={Server} title={t('analytics.requestsByProvider')}>
             {byPlatform.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
             ) : (
@@ -577,7 +640,7 @@ export default function AnalyticsPage() {
             )}
           </Panel>
 
-          <Panel title={t('analytics.requestsByAgent')}>
+          <Panel icon={Bot} title={t('analytics.requestsByAgent')}>
             {byClient.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
             ) : (
@@ -594,7 +657,7 @@ export default function AnalyticsPage() {
           </Panel>
 
           {/* Latency by provider: grouped avg + p95, same unit (ms), one axis. */}
-          <Panel title={t('analytics.avgLatencyByProvider')}>
+          <Panel icon={Gauge} title={t('analytics.avgLatencyByProvider')}>
             {byPlatform.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
             ) : (
@@ -613,7 +676,7 @@ export default function AnalyticsPage() {
           </Panel>
 
           {/* Time to first token by provider (single series → no legend). */}
-          <Panel title={t('analytics.ttftByProvider')}>
+          <Panel icon={Zap} title={t('analytics.ttftByProvider')}>
             {byPlatform.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
             ) : !ttftHasData ? (
@@ -632,7 +695,7 @@ export default function AnalyticsPage() {
           </Panel>
 
           {/* Errors by category: horizontal bars, destructive hue, no legend. */}
-          <Panel title={t('analytics.errorDistribution')}>
+          <Panel icon={TriangleAlert} title={t('analytics.errorDistribution')}>
             {!errorDist?.byCategory?.length ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('analytics.noErrors')}</p>
             ) : (
@@ -648,7 +711,7 @@ export default function AnalyticsPage() {
             )}
           </Panel>
 
-          <Panel title={t('analytics.errorsByProvider')}>
+          <Panel icon={CircleAlert} title={t('analytics.errorsByProvider')}>
             {!errorDist?.byPlatform?.length ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('analytics.noErrors')}</p>
             ) : (
@@ -664,7 +727,7 @@ export default function AnalyticsPage() {
             )}
           </Panel>
 
-          <Panel title={t('analytics.recentErrors')}>
+          <Panel icon={CircleAlert} title={t('analytics.recentErrors')}>
             {errors.length === 0 ? (
               <p className="text-sm text-muted-foreground text-center py-8">{t('analytics.noErrors')}</p>
             ) : (
@@ -700,6 +763,7 @@ export default function AnalyticsPage() {
               filters (server-side, so total reflects the filtered set). */}
           <div className="lg:col-span-2">
             <Panel
+              icon={List}
               title={t('analytics.recentCalls')}
               actions={
                 <div className="flex flex-wrap items-center gap-2">
@@ -710,6 +774,7 @@ export default function AnalyticsPage() {
                       { value: 'all', label: t('analytics.filterAll') },
                       { value: 'success', label: t('common.success') },
                       { value: 'error', label: t('analytics.errors') },
+                      { value: 'canceled', label: t('analytics.filterCanceled') },
                     ]}
                     ariaLabel={t('common.status')}
                   />
@@ -772,7 +837,7 @@ export default function AnalyticsPage() {
                             {r.requestedModel && r.requestedModel !== r.modelId ? ' *' : ''}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{r.platform}</TableCell>
-                          <TableCell className={`text-xs ${r.status === 'success' ? 'text-muted-foreground' : 'text-destructive'}`} title={r.error ?? undefined}>
+                          <TableCell className={`text-xs ${statusTextClass(r.status)}`} title={r.error ?? undefined}>
                             {r.status}
                           </TableCell>
                           {/* >1 = the request burned failover hops; that is the
@@ -796,7 +861,7 @@ export default function AnalyticsPage() {
               the charts above show volume/latency, this row surfaces the
               success-rate and error-count numbers (#335). */}
           <div className="lg:col-span-2">
-            <Panel title={t('analytics.providerBreakdown')}>
+            <Panel icon={Network} title={t('analytics.providerBreakdown')}>
               {byPlatform.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
               ) : (
@@ -846,7 +911,7 @@ export default function AnalyticsPage() {
           </div>
 
           <div className="lg:col-span-2">
-            <Panel title={t('analytics.perModelBreakdown')}>
+            <Panel icon={Layers} title={t('analytics.perModelBreakdown')}>
               {byModel.length === 0 ? (
                 <p className="text-sm text-muted-foreground text-center py-8">{t('common.noData')}</p>
               ) : (
@@ -889,7 +954,7 @@ export default function AnalyticsPage() {
           {/* Usage by key: only rendered when the endpoint returns rows. */}
           {byKey.length > 0 && (
             <div className="lg:col-span-2">
-              <Panel title={t('analytics.usageByKey')}>
+              <Panel icon={KeyRound} title={t('analytics.usageByKey')}>
                 <div className="max-h-[360px] overflow-y-auto -mx-4">
                   <Table>
                     <TableHeader>

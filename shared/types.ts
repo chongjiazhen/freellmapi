@@ -1,10 +1,23 @@
 // ---- Platform & Model Types ----
 
+/** A model declared beside a custom endpoint in an import file (#382). A
+ *  capability flag is present only when the paste declared it via a trailing
+ *  -TOOLS / -VISION suffix. */
+export interface ImportModelEntry {
+  id: string;
+  supportsTools?: boolean;
+  supportsVision?: boolean;
+}
+
 export interface PreviewKey {
   keyName: string;
   keyValue: string;
   detectedPlatform: string | null;
   prefix: string;
+  /** Custom endpoints only: the upstream URL the export file carried (#687). */
+  baseUrl?: string;
+  /** Custom endpoints only: models to register alongside the key (#382). */
+  models?: ImportModelEntry[];
   isDuplicate?: boolean;
 }
 
@@ -12,6 +25,8 @@ export interface ImportKey {
   keyName: string;
   keyValue: string;
   platform: string;
+  baseUrl?: string;
+  models?: ImportModelEntry[];
 }
 
 export interface PreviewResponse {
@@ -30,6 +45,8 @@ export interface ImportSelectedResponse {
   skipped: string[];
   errors: Array<{ key: string; error: string }>;
   total: number;
+  /** Models registered for imported custom endpoints (#382). */
+  modelsRegistered: number;
 }
 
 // Active platforms — must match server/src/providers/index.ts and
@@ -102,6 +119,13 @@ export type Platform =
   // (Google sign-in, no card, no region wall) at 10 RPM; catalog rows live in
   // the Oracle catalog (premium now, free after 30 days).
   | 'sealion'
+  // ModelScope (魔搭社区, Alibaba) — OpenAI-compatible inference API
+  // (api-inference.modelscope.cn/v1). Free tier is 2000 requests/day
+  // account-wide, but calls only work after the ModelScope account is bound to
+  // an Alibaba Cloud CHINA-site (cn) account with Chinese real-name
+  // verification — tokens mint without binding, then every call 401s. Catalog
+  // rows land after community testing confirms per-model behavior (#581).
+  | 'modelscope'
   // AI Horde — free, community-powered inference (volunteer workers) via an
   // OpenAI-compatible proxy (https://oai.aihorde.net/v1). Queue-based, so calls
   // can take tens of seconds; no tool support; usage is reported as kudos, not
@@ -187,9 +211,15 @@ export interface ApiKey {
   status: KeyStatus;
   enabled: boolean;
   keyless: boolean;
+  /** Whether an export file would actually contain this row. The server decides
+   *  it so the dialog's "will export N keys" cannot drift from the export. */
+  exportable: boolean;
   createdAt: string;
   lastCheckedAt: string | null;
   lastHealthError: string | null;
+  /** Model ids this key is limited to; null = serves every model of its
+   *  platform (#657). */
+  modelScope?: string[] | null;
   models?: ApiKeyModel[];
   cooldowns?: ApiKeyCooldown[];
 }
@@ -416,6 +446,8 @@ export type QuotaObservationSource = 'header' | 'quota_api' | 'error_body' | 'lo
 export interface ProviderQuotaState {
   platform: Platform;
   keyId: number;
+  /** The key's operator-facing label, when the row still names a live key. */
+  keyLabel?: string | null;
   quotaPoolKey: string;
   metric: QuotaMetric;
   limit: number | null;
