@@ -8,9 +8,14 @@ router instances segregated by data-privacy posture:
 - **Clean instance** (host `:3001` — the default port on purpose, so a client
   that never chose a tier fails safe) — Tier A only. Prompts you would not
   paste in a public gist may go here.
-- **Gray instance** (host `:3003`, `docker-compose.tiers.yml`) — everything
-  else worth keeping, opt-in for public-grade prompts wanting the full free
-  catalog. Assume every prompt is logged and may be used for training.
+- **Gray instance** (host `:3003`): everything else worth keeping, opt-in for
+  public-grade prompts wanting the full free catalog. Assume every prompt is
+  logged and may be used for training.
+
+Tiers are separate server instances, each booting with its own provider
+allowlist (`docker/tiers/{clean,gray}.config.example.json`). How you run the two
+is deployment's business: one container per tier, one process per tier, or two
+hosts. The allowlist is what enforces the split.
 - **Dropped** — providers whose operator risk isn't priced by "prompts are
   public": dead or malicious upstreams also poison fallback chains.
 
