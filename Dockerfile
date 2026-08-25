@@ -62,7 +62,14 @@ ENV FREELLMAPI_COMMIT_SHA=${FREELLMAPI_COMMIT_SHA}
 USER node
 
 EXPOSE 3001
-VOLUME ["/app/server/data"]
+
+# No VOLUME for /app/server/data on purpose. Persistence is the deployment's
+# job — docker-compose.yml maps the named `freellmapi-data` volume there, and a
+# plain `docker run` takes -v. Declaring it here instead creates an ANONYMOUS
+# volume on every container that doesn't override it: PaaS runtimes that build
+# from the Dockerfile (Railway, Render, Coolify, Dokploy, CapRover) then either
+# refuse the image or silently hand each redeploy a fresh empty volume, and the
+# declaration also shadows a bind mount made at the same path.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 3001) + '/api/ping').then((res) => { if (!res.ok) process.exit(1); }).catch(() => process.exit(1));"

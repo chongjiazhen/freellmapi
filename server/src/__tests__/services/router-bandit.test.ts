@@ -3,9 +3,13 @@ import {
   routeRequest, refreshStatsCache, getRoutingStrategy, setRoutingStrategy, getRoutingScores,
   getCustomWeights, setCustomWeights, getExploreEnabled, setExploreEnabled,
   getCommunityPrior, setCommunityPriors, getCommunityPriorEnabled, setCommunityPriorEnabled,
+  getPeakHoursConfig, setPeakHoursConfig,
 } from '../../services/router.js';
+import { BANDIT_PRESETS, DEFAULT_PEAK_HOURS } from '../../services/scoring.js';
+import { resetModelWeightOverrides } from '../../services/model-weight-overrides.js';
 import * as ratelimit from '../../services/ratelimit.js';
 import { getDb, initDb } from '../../db/index.js';
+import { addToActiveChain } from '../helpers/chain.js';
 
 vi.mock('../../services/ratelimit.js', async () => {
   const actual = await vi.importActual('../../services/ratelimit.js');
@@ -29,15 +33,17 @@ const ORIGINAL_NODE_ENV = process.env.NODE_ENV;
 function addModel(opts: {
   platform: string; modelId: string; name: string;
   intelligenceRank: number; sizeLabel: string; budget: string; priority: number;
+  vision?: boolean;
 }): number {
   const db = getDb();
   db.prepare(`
-    INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-  `).run(opts.platform, opts.modelId, opts.name, opts.intelligenceRank, 1, opts.sizeLabel, opts.budget);
+    INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, monthly_token_budget, enabled, supports_vision, supports_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, 1)
+  `).run(opts.platform, opts.modelId, opts.name, opts.intelligenceRank, 1, opts.sizeLabel, opts.budget, opts.vision ? 1 : 0);
   const id = (db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
     .get(opts.platform, opts.modelId) as { id: number }).id;
   db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, opts.priority);
+  addToActiveChain(id, opts.priority);
   // every platform needs at least one healthy key to be routable
   db.prepare(`
     INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
@@ -129,6 +135,33 @@ describe('bandit router', () => {
     expect(counts['y'] ?? 0).toBeGreaterThan(0);
   });
 
+  it('exploration draws are never wasted on a model that cannot serve the request', () => {
+    // vision-a is measured and wins every ordinary bandit draw. text-b and
+    // vision-c are both unmeasured, but only vision-c can serve a vision
+    // request. The pre-fix router put BOTH in the explore pool, so ~half the
+    // explore draws promoted text-b, which the main loop's vision gate then
+    // skipped — a wasted draw. With the pool filtered, vision-c receives
+    // every explore draw (~10% of requests); unfixed it got only ~5%, far
+    // below the 150/2000 bound asserted here.
+    setExploreEnabled(true);
+    addModel({ platform: 'google', modelId: 'vision-a', name: 'Vision A', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1, vision: true });
+    addModel({ platform: 'groq', modelId: 'text-b', name: 'Text B', intelligenceRank: 2, sizeLabel: 'Frontier', budget: '~50M', priority: 2 });
+    addModel({ platform: 'google', modelId: 'vision-c', name: 'Vision C', intelligenceRank: 30, sizeLabel: 'Small', budget: '~50M', priority: 3, vision: true });
+    addHistory('google', 'vision-a', { successes: 500, failures: 0, outTokens: 1000, latencyMs: 300, ttfbMs: 100 });
+    setRoutingStrategy('balanced');
+    refreshStatsCache(getDb(), true);
+
+    const counts: Record<string, number> = {};
+    for (let i = 0; i < 2000; i++) {
+      const r = routeRequest(100, undefined, undefined, /*requireVision=*/ true);
+      counts[r.modelId] = (counts[r.modelId] ?? 0) + 1;
+    }
+    // The loop gate already guarantees this half; the pool filter is what the
+    // vision-c bound below actually pins down.
+    expect(counts['text-b'] ?? 0).toBe(0);
+    expect(counts['vision-c'] ?? 0).toBeGreaterThan(150);
+  });
+
   it('smartest vs fastest flips which model wins, at equal reliability', () => {
     // Smart: frontier tier, slow. Fast: small tier, high throughput. Equal success.
     addModel({ platform: 'google', modelId: 'smart', name: 'Smart', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
@@ -182,18 +215,115 @@ describe('bandit router', () => {
   });
 
   it('getRoutingScores returns a per-axis breakdown ranked by score', () => {
-    addModel({ platform: 'google', modelId: 'm1', name: 'M1', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
-    addHistory('google', 'm1', { successes: 30, failures: 0, outTokens: 500, latencyMs: 1000, ttfbMs: 200 });
-    setRoutingStrategy('balanced');
-    refreshStatsCache(getDb(), true);
-    const { strategy, weights, scores } = getRoutingScores();
-    expect(strategy).toBe('balanced');
-    expect(weights).toEqual({ reliability: 0.5, speed: 0.25, intelligence: 0.25 });
-    expect(scores).toHaveLength(1);
-    expect(scores[0]).toMatchObject({ modelId: 'm1', enabled: true });
-    expect(scores[0].reliability).toBeGreaterThan(0.9);
-    expect(scores[0].score).toBeGreaterThan(0);
-    expect(scores[0].score).toBeLessThanOrEqual(1);
+    // The peak-hours adjustment (#760) is opt-in and off here, so the preset is
+    // returned verbatim — but the clock is still pinned to off-peak noon so this
+    // assertion can never depend on when CI happens to run.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T12:00:00'));
+    try {
+      addModel({ platform: 'google', modelId: 'm1', name: 'M1', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
+      addHistory('google', 'm1', { successes: 30, failures: 0, outTokens: 500, latencyMs: 1000, ttfbMs: 200 });
+      setRoutingStrategy('balanced');
+      refreshStatsCache(getDb(), true);
+      const { strategy, weights, scores } = getRoutingScores();
+      expect(strategy).toBe('balanced');
+      expect(weights).toEqual({ reliability: 0.5, speed: 0.25, intelligence: 0.25 });
+      expect(scores).toHaveLength(1);
+      expect(scores[0]).toMatchObject({ modelId: 'm1', enabled: true });
+      expect(scores[0].reliability).toBeGreaterThan(0.9);
+      expect(scores[0].score).toBeGreaterThan(0);
+      expect(scores[0].score).toBeLessThanOrEqual(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('peak-hours settings persist and default to off with the stock window', () => {
+    expect(getPeakHoursConfig()).toEqual(DEFAULT_PEAK_HOURS);
+    setPeakHoursConfig({ enabled: true, startHour: 9, endHour: 17, timezone: 'Asia/Kolkata' });
+    expect(getPeakHoursConfig()).toEqual({ enabled: true, startHour: 9, endHour: 17, timezone: 'Asia/Kolkata' });
+    setPeakHoursConfig({ enabled: false });
+    expect(getPeakHoursConfig().enabled).toBe(false);
+  });
+
+  it('rejects an out-of-range hour or an unknown timezone', () => {
+    expect(() => setPeakHoursConfig({ startHour: 24 })).toThrow(/peakStartHour/);
+    expect(() => setPeakHoursConfig({ startHour: -1 })).toThrow(/peakStartHour/);
+    expect(() => setPeakHoursConfig({ endHour: 6.5 })).toThrow(/peakEndHour/);
+    expect(() => setPeakHoursConfig({ timezone: 'Not/AZone' })).toThrow(/peakTimezone/);
+    // Nothing was written by the rejected calls.
+    expect(getPeakHoursConfig()).toEqual(DEFAULT_PEAK_HOURS);
+  });
+
+  it('leaves preset weights alone while the peak adjustment is off (#760)', () => {
+    vi.useFakeTimers();
+    // 20:00 UTC — squarely inside the default 18:00–06:00 window.
+    vi.setSystemTime(new Date('2026-01-15T20:00:00Z'));
+    try {
+      addModel({ platform: 'google', modelId: 'm1', name: 'M1', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
+      refreshStatsCache(getDb(), true);
+      for (const strategy of ['balanced', 'smartest', 'fastest', 'reliable'] as const) {
+        setRoutingStrategy(strategy);
+        const { weights, peakAdjusted } = getRoutingScores();
+        expect(weights).toEqual(BANDIT_PRESETS[strategy]);
+        expect(peakAdjusted).toBe(false);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shifts speed onto reliability inside the window, in the configured timezone (#760)', () => {
+    vi.useFakeTimers();
+    // 13:00 UTC = 18:30 in Kolkata (inside 18:00–06:00) and 13:00 in UTC (outside).
+    vi.setSystemTime(new Date('2026-01-15T13:00:00Z'));
+    try {
+      addModel({ platform: 'google', modelId: 'm1', name: 'M1', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
+      refreshStatsCache(getDb(), true);
+      setRoutingStrategy('balanced');
+
+      setPeakHoursConfig({ enabled: true, timezone: 'Asia/Kolkata' });
+      const inside = getRoutingScores();
+      expect(inside.peakAdjusted).toBe(true);
+      expect(inside.weights).toEqual({ reliability: 0.65, speed: 0.1, intelligence: 0.25 });
+
+      // Same instant, same flag — only the timezone moves it out of the window.
+      setPeakHoursConfig({ timezone: 'UTC' });
+      const outside = getRoutingScores();
+      expect(outside.peakAdjusted).toBe(false);
+      expect(outside.weights).toEqual(BANDIT_PRESETS.balanced);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('exempts fastest and reliable from the peak adjustment (#760)', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-15T20:00:00Z')); // inside the default window
+    try {
+      addModel({ platform: 'google', modelId: 'm1', name: 'M1', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
+      refreshStatsCache(getDb(), true);
+      setPeakHoursConfig({ enabled: true, timezone: 'UTC' });
+
+      for (const strategy of ['fastest', 'reliable'] as const) {
+        setRoutingStrategy(strategy);
+        const { weights, peakAdjusted } = getRoutingScores();
+        expect(weights).toEqual(BANDIT_PRESETS[strategy]);
+        expect(peakAdjusted).toBe(false);
+      }
+      for (const strategy of ['balanced', 'smartest'] as const) {
+        setRoutingStrategy(strategy);
+        expect(getRoutingScores().peakAdjusted).toBe(true);
+      }
+      // 'custom' is the operator's own vector and is never rewritten either.
+      setCustomWeights({ reliability: 0.1, speed: 0.9, intelligence: 0 });
+      setRoutingStrategy('custom');
+      const custom = getRoutingScores();
+      expect(custom.weights).toEqual({ reliability: 0.1, speed: 0.9, intelligence: 0 });
+      expect(custom.peakAdjusted).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('exploration toggle persists and defaults to off', () => {
@@ -223,6 +353,30 @@ describe('bandit router', () => {
     setExploreEnabled(true);
     const withExplore = pickCounts(500);
     expect(withExplore['new'] ?? 0).toBeGreaterThan(0);
+  });
+
+  it('exploration never probes a model zeroed out via MODEL_ROUTING_OVERRIDES (#738)', () => {
+    // A weight-0 model never wins a bandit draw, so it never accumulates the
+    // samples that would graduate it out of the unmeasured pool — without the
+    // probe exclusion it would receive explore traffic forever.
+    addModel({ platform: 'google', modelId: 'old', name: 'Old', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 1 });
+    addModel({ platform: 'groq', modelId: 'new', name: 'New', intelligenceRank: 1, sizeLabel: 'Frontier', budget: '~50M', priority: 2 });
+    addHistory('google', 'old', { successes: 500, failures: 0, outTokens: 1000, latencyMs: 300, ttfbMs: 100 });
+    setRoutingStrategy('balanced');
+    refreshStatsCache(getDb(), true);
+    setExploreEnabled(true);
+
+    const prev = process.env.MODEL_ROUTING_OVERRIDES;
+    process.env.MODEL_ROUTING_OVERRIDES = '{"new": 0}';
+    resetModelWeightOverrides();
+    try {
+      const counts = pickCounts(500);
+      expect(counts['new'] ?? 0).toBe(0);
+    } finally {
+      if (prev === undefined) delete process.env.MODEL_ROUTING_OVERRIDES;
+      else process.env.MODEL_ROUTING_OVERRIDES = prev;
+      resetModelWeightOverrides();
+    }
   });
 
   it('community priors persist, drop invalid entries, and cap effective sample size (#685)', () => {

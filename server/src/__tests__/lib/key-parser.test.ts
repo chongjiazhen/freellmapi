@@ -55,7 +55,16 @@ describe('key parser', () => {
     expect(detectPlatform('REQUESTY_')).toBe('requesty');
     expect(detectPlatform('NAVYAI_')).toBe('navy');
     expect(detectPlatform('SEALION_')).toBe('sealion');
+    expect(detectPlatform('ORCAROUTER_')).toBe('orcarouter');
+    expect(detectPlatform('ORCA_')).toBe('orcarouter');
+    expect(detectPlatform('UNOROUTER_')).toBe('unorouter');
+    expect(detectPlatform('UNO_ROUTER_')).toBe('unorouter');
+    expect(detectPlatform('XKIRO_')).toBe('xkiro');
     expect(detectPlatform('MODELSCOPE_')).toBe('modelscope');
+    expect(detectPlatform('ANYAPI_')).toBe('anyapi');
+    expect(detectPlatform('ANY_API_')).toBe('anyapi');
+    expect(detectPlatform('BAI_')).toBe('bai');
+    expect(detectPlatform('B_AI_')).toBe('bai');
     expect(detectPlatform('SAMBANOVA_')).toBeNull();
   });
 
@@ -66,7 +75,11 @@ describe('key parser', () => {
     expect(AUTH_JSON_PROVIDER_MAP['requesty']).toBe('requesty');
     expect(AUTH_JSON_PROVIDER_MAP['api-navy']).toBe('navy');
     expect(AUTH_JSON_PROVIDER_MAP['sea-lion']).toBe('sealion');
+    expect(AUTH_JSON_PROVIDER_MAP['orca-router']).toBe('orcarouter');
+    expect(AUTH_JSON_PROVIDER_MAP['uno-router']).toBe('unorouter');
     expect(AUTH_JSON_PROVIDER_MAP['model-scope']).toBe('modelscope');
+    expect(AUTH_JSON_PROVIDER_MAP['any-api']).toBe('anyapi');
+    expect(AUTH_JSON_PROVIDER_MAP['b-ai']).toBe('bai');
     const result = parseAuthJson(JSON.stringify({
       credential_pool: {
         gemini: [{ id: '1', label: 'Gemini', auth_type: 'api_key', access_token: 'AIza-test' }],

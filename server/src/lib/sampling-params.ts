@@ -23,6 +23,7 @@
 
 import { z } from 'zod';
 import type { Platform } from '@freellmapi/shared/types.js';
+import { getSetting } from '../db/index.js';
 
 // OpenAI's request-side reasoning knob. Wire values as of the current OpenAI
 // API: 'minimal'|'low'|'medium'|'high', plus 'none' (gpt-5.1). Forwarded
@@ -214,10 +215,24 @@ export interface PlatformParamPolicy {
   // experience as a broken stream rather than as a truncation. A
   // client-supplied value always wins, larger or smaller. Applied by the
   // adapters through resolveMaxTokens(), so a platform added here only takes
-  // effect once its adapter routes max_tokens through that helper
-  // (openai-compat + cloudflare already do).
+  // effect once its adapter routes max_tokens through that helper (they all
+  // do).
   defaultMaxTokens?: number;
+  // Output-token CEILING this platform's API enforces itself, applied by
+  // resolveMaxTokens() whatever the client asked for. The mirror image of
+  // defaultMaxTokens: a floor rescues a client that sent nothing, a cap
+  // rescues one that sent too much. Without it an aggressive max_tokens
+  // (Open WebUI's 65536 default) is a guaranteed 400 on every hop that lands
+  // on such a platform, and the fallback chain cannot repair it because the
+  // same value rides every candidate. Effective max_tokens is min(requested,
+  // this cap, the operator's unified cap).
+  maxTokensCap?: number;
 }
+
+/** GitHub Models' own output-token ceiling: asking for more 400s ("max_tokens
+ *  is too large"), so the request never reaches the model. Wired into the
+ *  github policy below as maxTokensCap. */
+export const GITHUB_MAX_OUTPUT_TOKENS = 400;
 
 // Keyed by Platform (not string) so a typo'd platform id fails tsc instead of
 // silently no-op'ing the policy; the string-typed accessors below cast at the
@@ -236,8 +251,14 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
   // GitHub Models sits on Azure OpenAI, which 400s "Unrecognized request
   // argument" for knobs outside the OpenAI set. Its reasoning_effort enum is
   // the older low/medium/high one, so 'none'/'minimal' are clamped rather
-  // than sent.
-  github: { drop: ['top_k', 'min_p', 'repetition_penalty'], reasoningEfforts: ['low', 'medium', 'high'] },
+  // than sent. Its free tier also refuses any max_tokens above
+  // GITHUB_MAX_OUTPUT_TOKENS, so the cap is clamped here instead of being
+  // spent as a wasted fallback hop.
+  github: {
+    drop: ['top_k', 'min_p', 'repetition_penalty'],
+    reasoningEfforts: ['low', 'medium', 'high'],
+    maxTokensCap: GITHUB_MAX_OUTPUT_TOKENS,
+  },
   // Gemini's generationConfig has no equivalents for these; the adapter
   // translates the rest natively (topK, seed, penalties, responseSchema, and
   // reasoning_effort → thinkingConfig — see toGeminiExtendedConfig).
@@ -313,15 +334,67 @@ export function defaultMaxTokensFor(platform: string): number | undefined {
   return PLATFORM_PARAM_POLICIES[platform as Platform]?.defaultMaxTokens;
 }
 
+/** This platform's own output-token ceiling, or undefined when it accepts
+ *  whatever max_tokens the client asks for. */
+export function maxTokensCapFor(platform: string): number | undefined {
+  return PLATFORM_PARAM_POLICIES[platform as Platform]?.maxTokensCap;
+}
+
 /**
  * The max_tokens to put on the wire for one request: whatever the client asked
- * for, or the platform's floor when the client asked for nothing (#553).
- * Never clamps — a client-set value passes through untouched in both
+ * for, or the platform's floor when the client asked for nothing (#553), then
+ * lowered to the tightest ceiling that applies — the platform's own
+ * maxTokensCap, the operator's unified cap, or both. With neither in play
+ * nothing is clamped — a client-set value passes through untouched in both
  * directions, and the gateway's own guardrails (token budget, routing reserve)
  * have already had their say by the time an adapter calls this.
+ *
+ * EVERY adapter must send max_tokens through here, or the cap is not unified:
+ * openai-compat (and its subclasses), cloudflare, cohere, google and aihorde
+ * all do.
  */
 export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
-  return requested ?? defaultMaxTokensFor(platform);
+  const resolved = requested ?? defaultMaxTokensFor(platform);
+  if (resolved == null) return resolved;
+  // The tighter ceiling wins: a platform's hard reject applies even with the
+  // operator cap off, and an operator cap below it applies everywhere.
+  const caps = [unifiedMaxTokensCap(), maxTokensCapFor(platform)].filter((c): c is number => c != null);
+  return caps.length === 0 ? resolved : Math.min(resolved, ...caps);
+}
+
+// ── Unified output-token cap ─────────────────────────────────────────────────
+// Optional operator-level ceiling on max_tokens for EVERY client. Aggressive
+// clients (Open WebUI sends max_tokens=65536 by default) 400 against free
+// models whose output limit is 32768 (CF qwen3-30b, zhipu glm), and without a
+// ceiling the same invalid value rides every fallback candidate — the chain
+// cannot rescue the request. The cap only LOWERS an
+// excessive value; a client value at or below it is untouched, and clients that
+// send nothing still get today's platform floor. 'off' (default) keeps the
+// historical pass-through behaviour.
+export const UNIFIED_MAX_TOKENS_SETTING = 'unified_max_tokens';
+/** The ceiling 'auto' clamps to: the output limit of the largest common free
+ *  catalog models. */
+export const UNIFIED_MAX_TOKENS_AUTO = 32768;
+
+/** The configured unified output cap, or null when disabled ('off'/unset).
+ *  'auto' resolves to UNIFIED_MAX_TOKENS_AUTO; an explicit integer is used
+ *  verbatim; anything else is treated as disabled so a bad value can't 400
+ *  requests. Reads the settings table on every call — cheap (better-sqlite3
+ *  sync read) and picks up dashboard changes without a restart, mirroring
+ *  guardrails.ts. */
+export function unifiedMaxTokensCap(): number | null {
+  let raw: string | undefined;
+  try {
+    raw = getSetting(UNIFIED_MAX_TOKENS_SETTING);
+  } catch {
+    return null; // DB not ready — never throw on the proxy hot path
+  }
+  if (!raw) return null;
+  const value = raw.trim().toLowerCase();
+  if (value === '' || value === 'off' || value === '0') return null;
+  if (value === 'auto') return UNIFIED_MAX_TOKENS_AUTO;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** True when this platform's policy strips response_format before send — the

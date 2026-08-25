@@ -13,7 +13,8 @@ import { mintDashboardToken } from '../helpers/auth.js';
 let dashToken = '';
 
 async function exportText(app: Express, format: string): Promise<string> {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const res = await fetch(`http://127.0.0.1:${addr.port}/api/keys/export?format=${format}`, {
     headers: { Authorization: `Bearer ${dashToken}`, 'x-reauth-password': 'password123' },
@@ -24,7 +25,8 @@ async function exportText(app: Express, format: string): Promise<string> {
 }
 
 async function importFile(app: Express, filename: string, content: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const form = new FormData();
   form.append('file', new Blob([content], { type: 'text/plain' }), filename);
@@ -39,7 +41,8 @@ async function importFile(app: Express, filename: string, content: string) {
 }
 
 async function listKeys(app: Express) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const res = await fetch(`http://127.0.0.1:${addr.port}/api/keys`, {
     headers: { Authorization: `Bearer ${dashToken}` },

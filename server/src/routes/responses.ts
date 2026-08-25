@@ -9,18 +9,22 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
+import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
 import { getDb } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt } from '../lib/system-prompt.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, messageHasImage } from '../lib/content.js';
+import { normalizeMessageImages } from '../lib/image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
   extractApiToken,
   getRequestGroupId,
   getStickyModel,
   setStickyModel,
+  streamReasoningText,
+  completionReasoningText,
   traceRouteEvent,
   logRequest,
 } from './proxy.js';
@@ -30,7 +34,7 @@ import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { samplingParamSchemaFields, pickSamplingParams, type ResponseFormat } from '../lib/sampling-params.js';
 import { enforceJsonContent } from '../lib/structured-output.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
+import { isClientAbortError, newClientAbortError, newHedgeAbortError } from '../lib/error-classify.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
@@ -100,9 +104,67 @@ const functionCallOutputItemSchema = z.object({
   output: z.union([z.string(), z.array(contentPartSchema), z.record(z.string(), z.unknown())]),
 });
 
+// Remaining official ResponseInputItemParam kinds. Codex computer-use round-trips
+// `computer_call` (the model's action request) and `computer_call_output` (the
+// harness's result, incl. screenshots); multi-turn sessions also replay
+// `reasoning` / `local_shell_call` items. We accept them all so validation never
+// 400s on a standard payload; each is then either mapped (below) or dropped
+// because chat-completions upstreams have no equivalent (computer/local_shell).
+// Each schema is permissive — we only consume the fields that matter.
+const computerCallItemSchema = z.object({
+  type: z.literal('computer_call'),
+  call_id: z.string(),
+  action: z.record(z.string(), z.unknown()).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const computerCallOutputItemSchema = z.object({
+  type: z.literal('computer_call_output'),
+  call_id: z.string(),
+  output: z.union([
+    z.string(),
+    z.array(contentPartSchema),
+    z.record(z.string(), z.unknown()),
+  ]).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const reasoningItemSchema = z.object({
+  type: z.literal('reasoning'),
+  summary: z.union([z.string(), z.array(contentPartSchema)]).optional(),
+  content: z.union([z.string(), z.array(contentPartSchema)]).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+const localShellCallItemSchema = z.object({
+  type: z.literal('local_shell_call'),
+  call_id: z.string().optional(),
+  action: z.record(z.string(), z.unknown()).optional(),
+  id: z.string().optional(),
+}).passthrough();
+
+// The rest of the official ResponseInputItemParam union: built-in tool calls
+// (web_search, file_search, code interpreter, image generation), MCP items,
+// and item references. None has a chat-completions equivalent — validated
+// loosely so a standard replay never 400s, then skipped at conversion like
+// the kinds above.
+const otherKnownItemSchema = z.object({
+  type: z.enum([
+    'web_search_call', 'file_search_call', 'code_interpreter_call',
+    'image_generation_call', 'mcp_call', 'mcp_list_tools',
+    'mcp_approval_request', 'mcp_approval_response', 'item_reference',
+  ]),
+  id: z.string().optional(),
+}).passthrough();
+
 const inputItemSchema = z.union([
   functionCallItemSchema,
   functionCallOutputItemSchema,
+  computerCallItemSchema,
+  computerCallOutputItemSchema,
+  reasoningItemSchema,
+  localShellCallItemSchema,
+  otherKnownItemSchema,
   messageItemSchema,
 ]);
 
@@ -158,65 +220,204 @@ function partsToString(content: string | Array<{ type: string; text?: unknown }>
     .join('');
 }
 
-// Image input via the Responses API isn't carried through translation yet
-// (partsToString flattens to text). Detect it so we can hard-fail with a clear
-// pointer to /v1/chat/completions rather than silently dropping the image
-// (#118, #125). Recognizes the Responses `input_image` part plus the
-// chat-style `image_url` / `image` parts some clients reuse here.
-export function responsesInputHasImage(req: ResponsesRequest): boolean {
-  if (typeof req.input === 'string') return false;
-  for (const item of req.input) {
-    const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    if (content.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'image_url' || type === 'image';
-    })) return true;
+// Responses content parts → internal chat content. Text parts map to text
+// blocks, image parts (Responses `input_image`, chat-style `image_url`/`image`,
+// and computer-use `computer_screenshot`) map to `image_url` blocks so vision
+// routing and the provider adapters see them (parity with /chat/completions).
+// `refusal` parts (assistant history replay) fold into text so the turn isn't
+// silently emptied. All-text content collapses back to a plain string (the
+// shape upstream chat providers and compression expect); an array comes back
+// only once a message actually carries an image.
+function partsToChatContent(content: string | Array<{ type: string; [k: string]: unknown }>): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail?: string } }> {
+  if (typeof content === 'string') return content;
+  const blocks: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail?: string } }> = [];
+  for (const p of content) {
+    const type = p.type;
+    const text = p.text;
+    if (type === 'text' || type === 'input_text' || type === 'output_text' || type === 'summary_text' || (type === undefined && typeof text === 'string')) {
+      if (typeof text === 'string') blocks.push({ type: 'text', text });
+      continue;
+    }
+    if (type === 'refusal') {
+      // The model's refusal text on a replayed assistant turn; chat providers
+      // have no refusal concept, so carry it as ordinary text.
+      const refusal = (p as { refusal?: unknown }).refusal;
+      if (typeof refusal === 'string') blocks.push({ type: 'text', text: refusal });
+      continue;
+    }
+    if (type === 'input_image' || type === 'computer_screenshot' || type === 'image_url' || type === 'image') {
+      // The image lives under `image_url`, as a bare data URL string
+      // (Responses `input_image` / `computer_screenshot`) or as
+      // `{ url }` (chat-style `image_url`). The Responses `detail` hint
+      // (low/high/auto/original) rides along; adapters without an equivalent
+      // (Gemini inlineData) ignore it. Unresolvable shapes (missing/empty
+      // url, file_id-only) are rejected up front by the route's pre-check,
+      // so dropping here never answers blind.
+      const url = extractPartImageUrl(p);
+      if (url) {
+        const detail = (p as { detail?: unknown }).detail;
+        blocks.push({ type: 'image_url', image_url: { url, ...(typeof detail === 'string' ? { detail } : {}) } });
+      }
+      continue;
+    }
   }
-  return false;
+  if (blocks.every((b) => b.type === 'text')) {
+    return blocks.map((b) => (b as { type: 'text'; text: string }).text).join('');
+  }
+  return blocks;
+}
+
+// Shared url extraction so the translation and the pre-check below always
+// agree on what counts as a resolvable image.
+function extractPartImageUrl(p: { [k: string]: unknown }): string | undefined {
+  const raw = p.image_url;
+  const url = typeof raw === 'string' ? raw : (raw as { url?: unknown } | undefined)?.url;
+  return typeof url === 'string' && url.length > 0 ? url : undefined;
+}
+
+// Responses `input_image` references an image by `image_url` OR a Files API
+// `file_id`. This proxy has no OpenAI Files backend, and the schema is
+// deliberately lenient, so an image part with no resolvable url (file_id-only,
+// or no url at all) can't survive translation — reject up front instead of
+// silently dropping it and answering blind to an image the client believes
+// was sent. (`computer_screenshot` shares these forms but is intentionally
+// not checked: computer use is rejected wholesale up front, today and until
+// it's a supported feature.)
+export function responsesInputHasFileIdImage(req: ResponsesRequest): boolean {
+  if (typeof req.input === 'string') return false;
+  return req.input.some((item) => {
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content)) return false;
+    return content.some((p) => {
+      const part = p as { type?: string; [k: string]: unknown };
+      if (part.type !== 'input_image') return false;
+      return extractPartImageUrl(part) === undefined;
+    });
+  });
+}
+
+// Computer use (the Responses `computer` / `computer_use_preview` tool + its
+// computer_call/computer_call_output items) has no chat-completions equivalent:
+// the harness loop needs the model's computer_actions and screenshot context,
+// neither of which survives translation. Fail clearly (mirroring the image 422)
+// rather than silently dropping the calls and breaking the tool loop.
+export function responsesInputRequestsComputerUse(req: ResponsesRequest): boolean {
+  if ((req.tools ?? []).some((t) => t.type === 'computer' || t.type === 'computer_use_preview')) return true;
+  if (typeof req.input === 'string' || req.input == null) return false;
+  return req.input.some((item) => {
+    const type = (item as { type?: string })?.type;
+    return type === 'computer_call' || type === 'computer_call_output';
+  });
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
 export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
-  const messages: ChatMessage[] = [];
+  const systemMessages: ChatMessage[] = [];
 
   if (req.instructions) {
-    messages.push({ role: 'system', content: req.instructions });
+    systemMessages.push({ role: 'system', content: req.instructions });
   }
 
   if (typeof req.input === 'string') {
-    messages.push({ role: 'user', content: req.input });
-    return messages;
+    const messages = [{ role: 'user' as const, content: req.input }];
+    return [...systemMessages, ...messages];
   }
 
-  for (const item of req.input) {
+  const messages: ChatMessage[] = [];
+
+  const items = req.input;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+
     if ('type' in item && item.type === 'function_call') {
-      messages.push({
-        role: 'assistant',
-        content: null,
-        tool_calls: [{
-          id: item.call_id,
+      // Parallel tool calls replay as consecutive standalone function_call
+      // items (no preceding assistant message item). Fold the run into one
+      // assistant turn, for the same reason as the message+function_call
+      // merge below: consecutive assistant turns 400 on strict upstreams.
+      const toolCalls: ChatToolCall[] = [];
+      let j = i;
+      while (j < items.length && (items[j] as { type?: string }).type === 'function_call') {
+        const fc = items[j] as z.infer<typeof functionCallItemSchema>;
+        toolCalls.push({
+          id: fc.call_id,
           type: 'function',
-          function: { name: item.name, arguments: item.arguments },
-        }],
-      });
-    } else if ('type' in item && item.type === 'function_call_output') {
+          function: { name: fc.name, arguments: fc.arguments },
+        });
+        j++;
+      }
+      messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+      i = j - 1;
+      continue;
+    }
+
+    if ('type' in item && item.type === 'function_call_output') {
       const output = typeof item.output === 'string'
         ? item.output
         : Array.isArray(item.output)
           ? partsToString(item.output as any)
           : JSON.stringify(item.output);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
-    } else {
-      // message item
-      const m = item as z.infer<typeof messageItemSchema>;
-      // 'developer' is the Responses-era system role.
-      const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToString(m.content) });
+      continue;
     }
+
+    if ('type' in item && item.type !== 'message') {
+      // computer_call / computer_call_output / reasoning / local_shell_call:
+      // no chat-message equivalent (the route 422s computer use up front).
+      // Skip rather than mis-parse as a message item.
+      continue;
+    }
+
+    // message item
+    const m = item as z.infer<typeof messageItemSchema>;
+    // 'developer' is the Responses-era system role.
+    const role = m.role === 'developer' ? 'system' : m.role;
+    const content = partsToChatContent(m.content);
+
+    if (role === 'system') {
+      // Hoist system/developer messages to the start of the conversation:
+      // chat providers (Gemini, Claude, Mistral) reject a system message that
+      // appears after a user turn. Codex history replay often emits developer
+      // items mid-conversation.
+      systemMessages.push({ role: 'system', content });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      // A Responses assistant turn is a message item followed by its
+      // function_call items. Merge them into a single chat assistant message
+      // (content + tool_calls); emitting consecutive assistant turns makes
+      // Gemini map them to consecutive model turns and strict upstreams
+      // (Mistral/Cohere) 400. Drop empty assistant items — an empty turn means
+      // nothing to a chat provider. (#96)
+      const toolCalls: ChatToolCall[] = [];
+      let j = i + 1;
+      while (j < items.length && (items[j] as { type?: string }).type === 'function_call') {
+        const fc = items[j] as z.infer<typeof functionCallItemSchema>;
+        toolCalls.push({
+          id: fc.call_id,
+          type: 'function',
+          function: { name: fc.name, arguments: fc.arguments },
+        });
+        j++;
+      }
+      if (toolCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: content.length > 0 ? content : null,
+          tool_calls: toolCalls,
+        });
+        i = j - 1;
+        continue;
+      }
+      if (content.length === 0) continue;
+      messages.push({ role: 'assistant', content });
+      continue;
+    }
+
+    messages.push({ role, content });
   }
 
-  return messages;
+  return [...systemMessages, ...messages];
 }
 
 export function toChatTools(tools?: ResponsesRequest['tools']): ChatToolDefinition[] | undefined {
@@ -256,6 +457,7 @@ export function buildResponseObject(opts: {
   toolCalls: ChatToolCall[];
   promptTokens: number;
   completionTokens: number;
+  reasoningTokens?: number;
 }) {
   const output: any[] = [];
   if (opts.text.length > 0) {
@@ -290,7 +492,7 @@ export function buildResponseObject(opts: {
       input_tokens: opts.promptTokens,
       input_tokens_details: { cached_tokens: 0 },
       output_tokens: opts.completionTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: opts.reasoningTokens ?? 0 },
       total_tokens: opts.promptTokens + opts.completionTokens,
     },
   };
@@ -333,14 +535,29 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const reqData = parsed.data;
 
-  // Vision isn't carried through the Responses translation yet — fail clearly
-  // instead of answering blind to a dropped image (#118, #125).
-  if (responsesInputHasImage(reqData)) {
+  // Computer use can't survive the chat-completions translation either (no
+  // computer tool, no screenshot context). Fail clearly instead of silently
+  // dropping the calls and breaking Codex's computer-use tool loop.
+  if (responsesInputRequestsComputerUse(reqData)) {
     res.status(422).json({
       error: {
-        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
+        message: 'Computer use is not yet supported on /v1/responses (the computer / computer_use_preview tool and computer_call items have no chat-completions equivalent).',
         type: 'invalid_request_error',
-        code: 'no_vision_model',
+        code: 'no_computer_use_model',
+      },
+    });
+    return;
+  }
+
+  // Unresolvable image parts (file_id-only, or no usable url) can't survive
+  // translation — fail clearly rather than dropping the image and answering
+  // blind.
+  if (responsesInputHasFileIdImage(reqData)) {
+    res.status(422).json({
+      error: {
+        message: "This request contains an image part that can't be resolved: input_image needs an image_url (an https URL or a base64 data URL); Files API file_id references aren't supported by this proxy.",
+        type: 'invalid_request_error',
+        code: 'unsupported_image_input',
       },
     });
     return;
@@ -392,18 +609,47 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // (`instructions` / system input items) follow it and cannot override it.
   messages = prependSystemPrompt(messages, auth.systemPrompt);
 
+  // Downscale over-threshold inline images before estimation/routing so the
+  // token budget, payload limits, and upstream transfer all see the shrunk
+  // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
+  await normalizeMessageImages(messages);
+
   const estimatedInputTokens = messages.reduce(
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
     0,
   );
+
+  // Image requests must route to a vision-capable model (mirrors
+  // /chat/completions, proxy.ts). Reject up front with a clear message when
+  // none is enabled; when vision models are available, requireVision routing
+  // skips text-only models — including a pinned/sticky one — and falls back to
+  // a vision-capable peer (#118, #125). A rough per-image token cost keeps
+  // budget routing from being skewed by content the text heuristic can't see.
+  const hasImage = messageHasImage(messages);
+  if (hasImage && !hasEnabledVisionModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_vision_model',
+      },
+    });
+    return;
+  }
+  const IMAGE_TOKEN_ESTIMATE = 1000;
+  const imageCount = messages.reduce((n, m) =>
+    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   // Capped output reserve so a large max_output_tokens can't falsely exclude the
-  // model pool (#470); input counts in full.
-  const estimatedTotal = estimatedInputTokens + routingReserveTokens(reqData.max_output_tokens);
+  // model pool (#470); input counts in full. Threaded to the router separately:
+  // it is exact and must not be inflated by the context-window safety margin
+  // (#956 review).
+  const outputReserve = routingReserveTokens(reqData.max_output_tokens);
+  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + outputReserve;
 
   // Guardrail: per-request token budget (request_max_tokens_budget, default
   // off). A request with no max_output_tokens gets its output capped to the
   // budget remainder instead of a rejection.
-  const budgetCheck = applyTokenBudget(estimatedInputTokens, completionOpts.max_tokens);
+  const budgetCheck = applyTokenBudget(estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE, completionOpts.max_tokens);
   if (budgetCheck.rejection) {
     res.status(413).json({
       error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
@@ -495,13 +741,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // writableEnded distinguishes a real disconnect.
   let clientGone = false;
   const clientAbort = new AbortController();
+  // Fallback-v2 hedging: the loop aborts this controller (via abortInFlight)
+  // when the wall-clock retry budget expires mid-attempt, canceling the
+  // in-flight upstream instead of waiting for a stalled attempt to time out.
+  const hedgeAbort = new AbortController();
   res.on('close', () => {
     if (!res.writableEnded) {
       clientGone = true;
       clientAbort.abort(newClientAbortError());
     }
   });
-  const dispatchOpts = { ...completionOpts, signal: clientAbort.signal };
+  const dispatchOpts = { ...completionOpts, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) };
 
   // Stream bookkeeping (used only when stream === true). `streamStarted` is the
   // commit flag: true once the response.created/in_progress skeleton has left,
@@ -520,8 +770,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     state,
     attemptLog,
     clientGone: () => clientGone,
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, false, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined),
-    dispatch: async (route, attempt) => {
+    abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, outputReserve),
+    dispatch: async (route, attempt, ctx) => {
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',
         requestId: requestGroupId,
@@ -531,12 +782,28 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         requestedModel: attempt === 0 ? requestedModelLabel : undefined,
       });
       if (stream) {
+        // Every output item (message text + each function_call) claims the next
+        // free index. OpenAI's streaming SDK indexes snapshot.output by
+        // output_index, so indices MUST be dense & unique — reusing 0 for the
+        // text item after a tool-call item had already taken it makes the SDK
+        // crash on `snapshot.output[output_index]` (#96, Codex computer-use).
         let outputIndex = 0;
         let msgItemId: string | null = null;
         let msgText = '';
+        // output_index of the open text item (valid while msgItemId !== null).
+        let textOutputIndex = 0;
         // tool-call accumulator keyed by the provider's tool_call index
         const toolAcc = new Map<number, { outputIndex: number; itemId: string; callId: string; name: string; args: string }>();
         let totalOutputTokens = 0;
+        // #764: thinking tokens are tracked separately so the final Response
+        // object can report `output_tokens_details.reasoning_tokens` truthfully
+        // instead of a hardcoded 0.
+        let totalReasoningTokens = 0;
+        // #764: ttfb = first token of ANY kind (content or reasoning), recorded
+        // in the pump loop; commit() only backfills streams that never produced
+        // one. This path previously logged no ttfb at all, so Analytics showed
+        // a null speed for every /v1/responses turn.
+        let ttfbMs: number | null = null;
 
         // Inline-dialect hold window (#231): first text is held until it
         // either matches a tool-call dialect marker (held to the end and
@@ -554,6 +821,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // on the same connection with no bytes on the wire. Idempotent.
         const commit = () => {
           if (streamStarted) return;
+          if (ttfbMs === null) ttfbMs = Date.now() - start;
           res.setHeader('Content-Type', 'text/event-stream');
           res.setHeader('Cache-Control', 'no-cache');
           res.setHeader('Connection', 'keep-alive');
@@ -566,22 +834,30 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           sse('response.created', { response: skeleton });
           sse('response.in_progress', { response: skeleton });
           streamStarted = true;
+          // Committed: the answer is on its way, so the retry budget must no
+          // longer cancel this attempt (it could not fail over now anyway).
+          ctx.disarmHedge();
         };
 
         // Open the text output item and stream `text` as its first delta.
+        // The text item takes the next free output index (it is NOT always 0 —
+        // when the model emits tool_calls first, the function_call items own
+        // the low indices). Every later text delta/done must reference this
+        // same index or the SDK snapshot lookup misroutes the deltas.
         const openTextItem = (text: string) => {
           commit();
           msgItemId = newId('msg');
+          textOutputIndex = outputIndex++;
           sse('response.output_item.added', {
-            output_index: outputIndex,
+            output_index: textOutputIndex,
             item: { id: msgItemId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
           });
           sse('response.content_part.added', {
-            item_id: msgItemId, output_index: outputIndex, content_index: 0,
+            item_id: msgItemId, output_index: textOutputIndex, content_index: 0,
             part: { type: 'output_text', text: '', annotations: [] },
           });
           if (text) {
-            sse('response.output_text.delta', { item_id: msgItemId, output_index: outputIndex, content_index: 0, delta: text });
+            sse('response.output_text.delta', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, delta: text });
             msgText += text;
           }
         };
@@ -614,12 +890,21 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             // Text deltas → output_text events on a single message item, after
             // the dialect hold window has decided the text is real prose.
             const text = delta.content ?? '';
+            // #764: reasoning models stream thinking before the first answer
+            // token — count that first token as ttfb so Analytics speed
+            // reflects the real head-of-stream, and count thinking tokens as
+            // real output consumption.
+            const reasoning = streamReasoningText(chunk);
+            if (ttfbMs === null && (text.length > 0 || reasoning.length > 0)) {
+              ttfbMs = Date.now() - start;
+            }
             if (text) {
-              totalOutputTokens += Math.ceil(text.length / 4);
+              totalOutputTokens += Math.ceil((text.length + reasoning.length) / 4);
+              if (reasoning.length > 0) totalReasoningTokens += Math.ceil(reasoning.length / 4);
               if (dialectMode === 'passthrough') {
                 if (msgItemId === null) openTextItem('');
                 sse('response.output_text.delta', {
-                  item_id: msgItemId, output_index: 0, content_index: 0, delta: text,
+                  item_id: msgItemId, output_index: textOutputIndex, content_index: 0, delta: text,
                 });
                 msgText += text;
               } else {
@@ -635,6 +920,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
                   }
                 }
               }
+            } else if (reasoning.length > 0) {
+              // #764: thinking-only chunk (no visible text yet) — count tokens.
+              totalOutputTokens += Math.ceil(reasoning.length / 4);
+              totalReasoningTokens += Math.ceil(reasoning.length / 4);
             }
 
             // Tool-call deltas → function_call item + argument deltas.
@@ -645,14 +934,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
                 // First time we see this tool call: open a new output item.
                 commit();
                 if (msgItemId !== null && msgText.length > 0) {
-                  // close the text item (always output index 0) before starting a function_call item
-                  sse('response.output_text.done', { item_id: msgItemId, output_index: 0, content_index: 0, text: msgText });
-                  sse('response.content_part.done', { item_id: msgItemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
-                  sse('response.output_item.done', { output_index: 0, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
+                  // close the text item (at its own output index) before starting a function_call item
+                  sse('response.output_text.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, text: msgText });
+                  sse('response.content_part.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
+                  sse('response.output_item.done', { output_index: textOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
                   msgItemId = null;
                 }
-                outputIndex = toolAcc.size + (msgText.length > 0 ? 1 : 0);
-                acc = { outputIndex, itemId: newId('fc'), callId: tc.id || newId('call'), name: tc.function?.name ?? '', args: '' };
+                acc = { outputIndex: outputIndex++, itemId: newId('fc'), callId: tc.id || newId('call'), name: tc.function?.name ?? '', args: '' };
                 toolAcc.set(idx, acc);
                 sse('response.output_item.added', {
                   output_index: acc.outputIndex,
@@ -672,7 +960,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // Held text was never emitted, so a dead dialect turn can still fail
           // over on the same SSE stream (nothing has been committed yet).
           if (heldText.length > 0) {
-            const rescue = (dialectMode === 'dialect' || containsDialectMarker(heldText))
+            const rescue = (wantsTools && (dialectMode === 'dialect' || containsDialectMarker(heldText)))
               ? rescueInlineToolCalls(heldText, new Set((tools ?? []).map(t => t.function.name)))
               : { detected: false as const, calls: null, cleanText: heldText };
             if (rescue.detected && !rescue.calls) {
@@ -690,7 +978,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
                 const idx = 1000 + rescuedIdx++; // synthetic accumulator keys, past any provider index
                 commit();
                 const acc = {
-                  outputIndex: toolAcc.size + (msgText.length > 0 ? 1 : 0),
+                  outputIndex: outputIndex++,
                   itemId: newId('fc'), callId: newId('call'), name: c.name, args: c.arguments,
                 };
                 toolAcc.set(idx, acc);
@@ -732,9 +1020,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
           // Finalize any open text item.
           if (msgItemId !== null) {
-            sse('response.output_text.done', { item_id: msgItemId, output_index: 0, content_index: 0, text: msgText });
-            sse('response.content_part.done', { item_id: msgItemId, output_index: 0, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
-            sse('response.output_item.done', { output_index: 0, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
+            sse('response.output_text.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, text: msgText });
+            sse('response.content_part.done', { item_id: msgItemId, output_index: textOutputIndex, content_index: 0, part: { type: 'output_text', text: msgText, annotations: [] } });
+            sse('response.output_item.done', { output_index: textOutputIndex, item: { id: msgItemId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: msgText, annotations: [] }] } });
           }
           // Finalize tool-call items. Arguments are repaired against the tool's
           // parameter schema at this point (after the full string accumulated):
@@ -742,6 +1030,17 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           // Codex hard-rejects the call ("invalid type: string, expected a
           // sequence"). Clients consume the *.done events / final response for
           // arguments, so repairing here covers the streamed path too.
+          //
+          // No schema verdict here, deliberately. This surface commits on the
+          // FIRST tool-call delta (`commit()` above, where the function_call
+          // item is opened) — the arguments are not complete until this point,
+          // which is long after the skeleton and the item.added events have
+          // left. A verdict here could only turn a delivered-but-invalid call
+          // into a `response.failed` on a stream the client is already reading,
+          // which is strictly worse. Wiring it would mean holding the
+          // function_call item until its arguments finish, the way
+          // /chat/completions buffers — a change to this route's commit point,
+          // not to validation.
           const finalToolCalls: ChatToolCall[] = [];
           for (const acc of toolAcc.values()) {
             const repairedArgs = repairToolArguments(acc.args, toolSchemas.get(acc.name));
@@ -753,6 +1052,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           const finalResponse = buildResponseObject({
             id: responseId, model: route.modelId, text: msgText,
             toolCalls: finalToolCalls, promptTokens: estimatedInputTokens, completionTokens: totalOutputTokens,
+            reasoningTokens: totalReasoningTokens,
           });
           sse('response.completed', { response: finalResponse });
           res.end();
@@ -769,7 +1069,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs);
           return 'done';
         } catch (streamErr: any) {
           // Client abort mid-stream: the pump's own `if (clientGone) break`
@@ -792,7 +1092,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: safe,
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safe);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safe, ttfbMs);
             sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: `Provider error (${route.displayName}): stream interrupted`, type: 'stream_error' } } });
             res.end();
             return 'committed';
@@ -832,8 +1132,24 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           text = rescue.cleanText;
         }
       }
+
+      // Opt-in schema verdict on what the repair could not fix. Thrown before
+      // anything is written, so the failover hop is invisible to the client.
+      if (isToolArgumentValidationEnabled() && toolCalls.length > 0) {
+        const invalid = invalidToolCallReasons(toolCalls, toolSchemas);
+        if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+      }
+
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
-      const completionTokens = result.usage?.completion_tokens ?? Math.ceil(text.length / 4);
+      // #764: include reasoning tokens (message.reasoning_content / reasoning)
+      // in the chars/4 estimate so thinking models aren't undercounted when the
+      // provider omits `usage`.
+      const completionTokens = result.usage?.completion_tokens
+        ?? Math.ceil((text.length + completionReasoningText(result).length) / 4);
+      // #764: report reasoning_tokens truthfully — the provider's own count
+      // when advertised, else the same chars/4 estimate of the thinking text.
+      const reasoningTokens = result.usage?.completion_tokens_details?.reasoning_tokens
+        ?? Math.ceil(completionReasoningText(result).length / 4);
 
       // Empty completion → fail over via the shared loop (see the streaming
       // path); finish_reason 'length' skips the cooldown/penalty.
@@ -873,7 +1189,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       setFallbackHeaders(res, attempt, attemptLog);
       res.json(buildResponseObject({
         id: responseId, model: route.modelId, text, toolCalls,
-        promptTokens, completionTokens,
+        promptTokens, completionTokens, reasoningTokens,
       }));
 
       traceRouteEvent('Responses', {

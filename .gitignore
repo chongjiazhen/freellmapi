@@ -15,6 +15,9 @@ server/data/
 .env.local
 .DS_Store
 
+# TypeScript incremental build cache
+*.tsbuildinfo
+
 # Personal deployment scripts (contain keys/credentials — kept local)
 deploy-pi.sh
 update-hermes.sh

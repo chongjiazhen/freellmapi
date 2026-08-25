@@ -9,7 +9,7 @@ import { listAllMediaModels } from '../services/media.js';
 
 export const mediaRouter = Router();
 
-// Generative-media models (image + audio/TTS) for the dashboard Image/Audio tabs.
+// Generative-media models for the dashboard Image/Video/Audio tabs.
 // Mirrors the embeddings tab: a flat list with an enable toggle per row. keyCount
 // surfaces whether the row's platform has a usable key configured.
 mediaRouter.get('/', (_req: Request, res: Response) => {
@@ -48,11 +48,14 @@ mediaRouter.get('/', (_req: Request, res: Response) => {
 // token counts are reported. As with embeddings there is no budget
 // denominator — `media_models` only carries a free-text `quota_label`
 // ("Shared 10k neurons/day", "MP3 output - multilingual", which is not even a
-// quota) — so the summary shows spend and the label verbatim.
+// quota) — so the summary shows spend and the label verbatim. Transcription
+// rows are logged the same way (request_type='transcription', see
+// logMedia), so the Audio tab's STT section can show the same per-model
+// counts instead of dead-ending on a 400.
 mediaRouter.get('/usage', (req: Request, res: Response) => {
-  const parsed = z.enum(['image', 'audio']).safeParse(req.query.modality);
+  const parsed = z.enum(['image', 'video', 'audio', 'transcription']).safeParse(req.query.modality);
   if (!parsed.success) {
-    res.status(400).json({ error: { message: 'modality must be image or audio' } });
+    res.status(400).json({ error: { message: 'modality must be image, video, audio or transcription' } });
     return;
   }
   const modality = parsed.data;
@@ -99,7 +102,10 @@ const customMediaSchema = z.object({
   baseUrl: z.string().url('baseUrl must be a valid URL'),
   model: z.string().min(1),
   displayName: z.string().optional(),
-  modality: z.enum(['image', 'audio']),
+  // 'transcription' registers a custom OpenAI-compatible STT endpoint. The
+  // media_models table, GET /api/media/usage, the /v1/audio/transcriptions
+  // handler and the media service's 'custom' adapter all accept it.
+  modality: z.enum(['image', 'audio', 'transcription']),
   apiKey: z.string().optional(),
   label: z.string().optional(),
   quotaLabel: z.string().optional(),

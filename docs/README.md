@@ -6,7 +6,7 @@ The root [README](../README.md) is the product overview; the detailed guides liv
 
 ## Guides
 
-- **[Install & deploy](install.md)** — quick start, Docker Compose, local development, declarative startup config, the Docker image, backups, the desktop app, and where your data lives.
+- **[Install & deploy](install.md)** — quick start, Docker Compose, local development, declarative startup config, the Docker image, backups, the desktop app, where your data lives, and an FAQ on password resets, logs and uninstalling.
 - **[API reference](api.md)** — chat completions, `auto:*` routing strategies, streaming, tool calling, vision, Gemini Google Search grounding, embeddings, response headers, and the Anthropic Messages surface.
 - **[Clients & coding agents](clients.md)** — OpenAI-compatible clients, recipes for Claude Code / Codex CLI / Cline / Continue / Aider / opencode / Cursor, the MCP server, editor autocomplete, and Context Handoff.
 - **[Prompt compression](compression.md)** — request-side modes, safeguards, per-request controls, custom tool-output filters, statistics, and preview APIs.

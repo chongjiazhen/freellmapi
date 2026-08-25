@@ -6,6 +6,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { keysRouter } from './routes/keys.js';
 import { clientProfilesRouter } from './routes/client-profiles.js';
+import { conversationsRouter } from './routes/conversations.js';
+import { logsRouter } from './routes/logs.js';
 import { modelsRouter } from './routes/models.js';
 import { proxyRouter } from './routes/proxy.js';
 import { responsesRouter } from './routes/responses.js';
@@ -16,8 +18,10 @@ import { embeddingsRouter } from './routes/embeddings.js';
 import { mediaRouter } from './routes/media.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
+import { freeTierRouter } from './routes/free-tier.js';
 import { settingsRouter } from './routes/settings.js';
 import { premiumRouter } from './routes/premium.js';
+import { backupsRouter } from './routes/backups.js';
 import { cacheRouter } from './routes/cache.js';
 import { compressionRouter } from './routes/compression.js';
 import { authRouter } from './routes/auth.js';
@@ -171,9 +175,21 @@ export function createApp(config?: Config) {
       callback(null, !origin || allowedCorsOrigins.has(origin));
     },
   }));
-  // 10mb: code agents (OpenCode, AionUI, Qwen Code) ship very large system
-  // prompts + tool schemas + repo context; 1mb cut their sessions off
-  // mid-conversation with an opaque 413. (#200)
+  // Two-tier JSON body limits. The LLM wire surfaces carry vision payloads —
+  // base64 images inline in the body (~33% inflation; google.ts forwards
+  // images up to 8MB apiece) — so a single-screenshot Codex turn can clear
+  // 10MB and used to 413 HERE, before auth/routing: no fallback attempt, no
+  // analytics row, just an opaque 'request entity too large'. Those surfaces
+  // get the larger REQUEST_BODY_LIMIT_MB ceiling (default 25MB); everything
+  // else keeps the #200 limit — code agents (OpenCode, AionUI, Qwen Code)
+  // ship very large system prompts + tool schemas + repo context, and 1mb cut
+  // their sessions off mid-conversation. body-parser skips requests whose
+  // body was already parsed, so the second parser only sees what the first
+  // didn't own; an over-limit body throws from whichever parser matched.
+  app.use(
+    ['/v1', '/v1beta', '/mcp', '/api/chat', '/api/generate', '/api/embed', '/api/embeddings'],
+    express.json({ limit: cfg.requestBodyLimitBytes }),
+  );
   app.use(express.json({ limit: '10mb' }));
 
   // Caller identity (IP + User-Agent) for request analytics, carried in
@@ -216,6 +232,13 @@ export function createApp(config?: Config) {
   // /api — the profile keys it mints authenticate only the /v1 inference
   // surface and are never valid here.
   app.use('/api/client-profiles', requireAuth, clientProfilesRouter);
+  // Saved Playground transcripts (the chat sidebar). Dashboard-session gated
+  // like every other admin route; the unified /v1 key does not open it.
+  app.use('/api/conversations', requireAuth, conversationsRouter);
+  // Server logs for the dashboard viewer. Dashboard-session gated like the rest
+  // of /api — these lines name providers, models and key ids, so the unified
+  // /v1 key must not open them.
+  app.use('/api/logs', requireAuth, logsRouter);
   app.use('/api/models', requireAuth, modelsRouter);
   app.use('/api/profiles', requireAuth, profilesRouter);
   app.use('/api/fallback', requireAuth, fallbackRouter);
@@ -223,8 +246,13 @@ export function createApp(config?: Config) {
   app.use('/api/media', requireAuth, mediaRouter);
   app.use('/api/analytics', requireAuth, analyticsRouter);
   app.use('/api/health', requireAuth, healthRouter);
+  app.use('/api/free-tier', requireAuth, freeTierRouter);
   app.use('/api/settings', requireAuth, settingsRouter);
   app.use('/api/premium', requireAuth, premiumRouter);
+  // Database dumps and restores. Dashboard-session gated: the dump files carry
+  // encrypted provider keys and every routing setting, so the unified /v1 key
+  // must not open this surface.
+  app.use('/api/backups', requireAuth, backupsRouter);
   app.use('/api/cache', requireAuth, cacheRouter);
   app.use('/api/compression', requireAuth, compressionRouter);
   app.use('/api/update', requireAuth, updateRouter);

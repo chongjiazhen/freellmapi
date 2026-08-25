@@ -12,7 +12,8 @@ let app: Express;
 let token: string;
 
 async function request(path: string, password?: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
   if (password !== undefined) headers['x-reauth-password'] = password;
@@ -23,7 +24,8 @@ async function request(path: string, password?: string) {
 }
 
 async function addKey(key = 'gsk_testkey123') {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const res = await fetch(`http://127.0.0.1:${addr.port}/api/keys`, {
     method: 'POST',
