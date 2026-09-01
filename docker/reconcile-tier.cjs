@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /*
  * reconcile-tier.cjs - boot-time data-residency guard for a tier-segregated
- * freellmapi instance (see docs/provider-tiers.md, docker/README.md, and the
- * allowlist source docker/tiers/clean.config.example.json).
+ * freellmapi instance (see docker/README.md and the allowlist source
+ * docker/tiers/clean.config.example.json). The per-provider privacy research
+ * behind which providers are allowlisted is kept privately, not in this repo.
  *
  * PROBLEM IT CLOSES. Tiers are assigned by flipping flags in a DB that was
  * CLONED from the default instance (docker-compose.tiers.yml header). A re-clone,
