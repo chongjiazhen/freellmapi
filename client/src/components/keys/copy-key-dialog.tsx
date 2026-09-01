@@ -10,6 +10,16 @@ import { copyText } from '@/lib/clipboard'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
 
+// #786: the desktop build has no user-set password (its machine user's
+// password is random and never shown), so the re-verification dialog would
+// lock desktop users out of copying a full key. The desktop server skips
+// re-auth (FREEAPI_DESKTOP) for local requests, so here we just hide the
+// password field. Only the Electron preload sets this flag, so a browser
+// reaching the same desktop server over LAN still gets the field — and the
+// server still demands the password from it.
+const isDesktopApp = typeof window !== 'undefined'
+  && (window as Window & { __FREEAPI_DESKTOP__?: boolean }).__FREEAPI_DESKTOP__ === true
+
 // #705: the list only ever shows a masked key, and the sole way to read one
 // back was to export every key to a file. This narrows that to one key, behind
 // the same password re-verification the export uses: a live session is not
@@ -41,7 +51,9 @@ export function CopyKeyDialog({
     try {
       const { key } = await apiFetch<{ key: string }>(`/api/keys/${keyId}/reveal`, {
         method: 'POST',
-        headers: { 'x-reauth-password': password },
+        // The desktop server skips re-auth for this local request (#786); the
+        // web build still needs it.
+        headers: isDesktopApp ? undefined : { 'x-reauth-password': password },
       })
       // A plain-HTTP LAN origin has no Clipboard API at all, so this falls back
       // to execCommand rather than throwing (#734). If even that fails the key
@@ -75,25 +87,28 @@ export function CopyKeyDialog({
         </code>
 
         <form onSubmit={submit} className="mt-4 space-y-4">
-          <div className="space-y-1.5">
-            <Label className="text-xs" htmlFor="reveal-password">{t('auth.password')}</Label>
-            <Input
-              id="reveal-password"
-              type="password"
-              autoFocus
-              autoComplete="current-password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              aria-invalid={!!error}
-            />
-            <FieldError error={error} />
-          </div>
+          {!isDesktopApp && (
+            <div className="space-y-1.5">
+              <Label className="text-xs" htmlFor="reveal-password">{t('auth.password')}</Label>
+              <Input
+                id="reveal-password"
+                type="password"
+                autoFocus
+                autoComplete="current-password"
+                value={password}
+                onChange={e => setPassword(e.target.value)}
+                aria-invalid={!!error}
+              />
+              <FieldError error={error} />
+            </div>
+          )}
+          {isDesktopApp && error && <FieldError error={error} />}
 
           <div className="flex items-center justify-end gap-2">
             <Button type="button" variant="outline" size="sm" onClick={() => onOpenChange(false)}>
               {t('common.cancel')}
             </Button>
-            <Button type="submit" size="sm" disabled={!password || busy}>
+            <Button type="submit" size="sm" disabled={(!isDesktopApp && !password) || busy}>
               <Copy className="size-3.5" />
               {t('keys.copyKey')}
             </Button>

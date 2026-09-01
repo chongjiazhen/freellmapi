@@ -74,7 +74,8 @@ describe('GET /api/settings/version', () => {
   });
 
   async function get(headers: Record<string, string>) {
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/api/settings/version`, { headers });
     const body = await res.json().catch(() => null);
@@ -99,7 +100,8 @@ describe('GET /api/settings/version', () => {
     // its value. Mounting there would have shadowed it and produced a dead route
     // besides. This asserts /api/version is still ANSWERED BY OLLAMA: with the
     // emulation off (the default) that is its own 404, never a version payload.
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/api/version`);
     const body = await res.json();

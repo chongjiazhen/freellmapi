@@ -1,16 +1,27 @@
-import { useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { ModelCombobox } from '@/components/model-combobox'
 import { FieldError } from '@/components/ui/field-error'
-import type { Platform } from '../../../../shared/types'
+import type { ApiKey, Platform } from '../../../../shared/types'
 import { useI18n } from '@/i18n'
 import { toast } from '@/lib/toast'
+import type { FallbackEntry } from '@/lib/routing'
+import { scopeCandidates, shouldOfferModelPicker, type ScopeCandidate } from '@/lib/model-scope-selection'
 import { GetKeyLink, PLATFORMS } from './shared'
+
+/** A key that just landed, plus the models the picker should offer for it.
+ *  Only produced when the picker is actually worth showing (#657) — otherwise
+ *  the add stays as silent as it has always been. */
+export interface AddedKeyScopeOffer {
+  keyId: number
+  platformLabel: string
+  candidates: ScopeCandidate[]
+}
 
 // The "Provider key" pane of the Add key dialog: paste a credential for a known
 // provider. Extracted verbatim from the old inline KeysPage form so all field
@@ -19,7 +30,10 @@ import { GetKeyLink, PLATFORMS } from './shared'
 // `initialPlatform` preselects the provider (checklist-chip entry); the field
 // stays editable. The dialog remounts this pane per open, so a plain initial
 // state is enough.
-export function AddKeyForm({ onSuccess, initialPlatform }: { onSuccess: () => void; initialPlatform?: Platform }) {
+//
+// `onSuccess` may carry a scope offer for the key that was just added; the
+// dialog owns that follow-up because this pane unmounts the moment it closes.
+export function AddKeyForm({ onSuccess, initialPlatform }: { onSuccess: (offer?: AddedKeyScopeOffer) => void; initialPlatform?: Platform }) {
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [platform, setPlatform] = useState<Platform | ''>(initialPlatform ?? '')
@@ -33,11 +47,64 @@ export function AddKeyForm({ onSuccess, initialPlatform }: { onSuccess: () => vo
   // single-key field masks what you type, and a textarea cannot.
   const [several, setSeveral] = useState(false)
 
+  // #707: the platform dropdown had no search and no way to skip providers that
+  // already have keys, which is painful at thirty-odd entries. The shared
+  // ModelCombobox already does search + arrow keys, so this reuses it and only
+  // supplies the options. PLATFORMS keeps its curated order — it is sorted by
+  // recommendation, not alphabetically — and the search box handles "find it
+  // fast". The added/not-added split reads the same ['keys'] query the
+  // Providers tab owns, so it costs no extra request.
+  const { data: keys = [] } = useQuery<ApiKey[]>({
+    queryKey: ['keys'],
+    queryFn: () => apiFetch('/api/keys'),
+  })
+  const addedPlatforms = useMemo(() => new Set(keys.map(k => k.platform)), [keys])
+  const [hideAdded, setHideAdded] = useState(false)
+
+  // #657 post-add scope picker: the platform's model list. This is the same
+  // ['fallback'] query the Models page, the fallback chain and the command
+  // palette already run — react-query dedupes it, so opening this pane costs at
+  // most one GET that the rest of the dashboard was going to make anyway. That
+  // is why the picker needs no new endpoint and no widening of POST /api/keys
+  // (whose response only carries a model COUNT, not the ids). An empty or
+  // still-loading list simply means no picker, which is the old behaviour.
+  const { data: catalog = [] } = useQuery<FallbackEntry[]>({
+    queryKey: ['fallback'],
+    queryFn: () => apiFetch('/api/fallback'),
+  })
+
+  // Whether the key that just landed is worth offering the picker for, and the
+  // rows to offer. Anything missing — no id back, a keyless sentinel, a catalog
+  // too small or not loaded — returns undefined, and the add stays silent.
+  function scopeOffer(keyId: number | undefined, added: string): AddedKeyScopeOffer | undefined {
+    if (typeof keyId !== 'number') return undefined
+    const provider = PLATFORMS.find(p => p.value === added)
+    // Keyless gateways are excluded from scope editing on the key row too — no
+    // credential means nothing was bought per model group.
+    if (!provider || provider.keyless) return undefined
+    const candidates = scopeCandidates(catalog, added)
+    if (!shouldOfferModelPicker(candidates)) return undefined
+    return { keyId, platformLabel: provider.label, candidates }
+  }
+
+  const platformOptions = useMemo(
+    () => PLATFORMS
+      // The selected provider always stays listed, so hiding added ones never
+      // blanks out the trigger label.
+      .filter(p => !hideAdded || !addedPlatforms.has(p.value) || p.value === platform)
+      .map(p => ({
+        value: p.value,
+        label: p.label,
+        sub: addedPlatforms.has(p.value) ? t('keys.discoverAlreadyAdded') : undefined,
+      })),
+    [hideAdded, addedPlatforms, platform, t],
+  )
+
   const addKey = useMutation({
     meta: { silenceToast: true },
     mutationFn: (body: { platform: string; key: string; label?: string }) =>
-      apiFetch<{ notice?: string | null }>('/api/keys', { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: (data) => {
+      apiFetch<{ id: number; notice?: string | null }>('/api/keys', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: (data, variables) => {
       queryClient.invalidateQueries({ queryKey: ['keys'] })
       queryClient.invalidateQueries({ queryKey: ['health'] })
       queryClient.invalidateQueries({ queryKey: ['fallback'] })
@@ -47,7 +114,7 @@ export function AddKeyForm({ onSuccess, initialPlatform }: { onSuccess: () => vo
       // current catalog tier yet (#438) — surfaced as a toast now that the
       // dialog closes on success.
       if (data?.notice) toast.info(data.notice)
-      onSuccess()
+      onSuccess(scopeOffer(data?.id, variables.platform))
     },
   })
 
@@ -111,16 +178,32 @@ export function AddKeyForm({ onSuccess, initialPlatform }: { onSuccess: () => vo
       <form onSubmit={handleSubmit} className="flex flex-wrap gap-3">
         <div className="space-y-1.5">
           <Label className="text-xs">{t('keys.platform')}</Label>
-          <Select value={platform} onValueChange={(v) => setPlatform(v as Platform)}>
-            <SelectTrigger className="w-[220px]" aria-invalid={addAttempted && !!platformError}>
-              <SelectValue placeholder={t('keys.selectPlatform')} />
-            </SelectTrigger>
-            <SelectContent>
-              {PLATFORMS.map(p => (
-                <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <ModelCombobox
+            value={platform}
+            options={platformOptions}
+            onSelect={v => setPlatform(v as Platform)}
+            ariaLabel={t('keys.platform')}
+            triggerPlaceholder={t('keys.selectPlatform')}
+            placeholder={t('keys.filterPlaceholder')}
+            emptyText={t('keys.noFilterMatch')}
+            align="start"
+            ariaInvalid={addAttempted && !!platformError}
+            triggerClassName={`flex h-8 w-[220px] items-center justify-between gap-2 whitespace-nowrap rounded-lg border bg-transparent px-3 text-sm outline-none transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30 ${addAttempted && platformError ? 'border-destructive' : 'border-input'}`}
+            header={
+              <div className="flex items-center gap-2 border-b px-3 py-2">
+                <input
+                  id="hide-added-platforms"
+                  type="checkbox"
+                  checked={hideAdded}
+                  onChange={e => setHideAdded(e.target.checked)}
+                  className="size-3.5 accent-foreground"
+                />
+                <label htmlFor="hide-added-platforms" className="text-xs text-muted-foreground">
+                  {t('keys.hideAdded')}
+                </label>
+              </div>
+            }
+          />
           {addAttempted && <FieldError error={platformError} />}
           {(() => {
             const sel = PLATFORMS.find(p => p.value === platform)

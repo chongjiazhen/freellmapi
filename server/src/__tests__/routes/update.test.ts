@@ -11,7 +11,7 @@ const VERSION = '0.6.8';
 
 function httpGet(app: Express, path: string): Promise<{ status: number; body: any }> {
   return new Promise((resolve, reject) => {
-    const server = app.listen(0, () => {
+    const server = app.listen(0, '127.0.0.1', () => {
       const address = server.address();
       if (!address || typeof address === 'string') return reject(new Error('No test server address'));
       const req = http.request(

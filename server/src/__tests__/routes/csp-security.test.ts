@@ -11,7 +11,8 @@ async function getHeaders(
   forwardedProto?: string,
   host?: string,
 ): Promise<Headers> {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const headers: Record<string, string> = {};
   if (forwardedProto) headers['x-forwarded-proto'] = forwardedProto;

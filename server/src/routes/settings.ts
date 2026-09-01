@@ -1,12 +1,16 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
-import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting } from '../db/index.js';
-import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, isProxyActive, getProxyUrl, isProxyEnabled, getProxyBypassPlatforms, PROXY_SCHEMES } from '../lib/proxy.js';
+import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting, getDb } from '../db/index.js';
+import { applyProxyUrl, applyProxyMode, applyProxyEnabled, applyProxyBypass, applyFetchRelayToken, encodeFetchRelayToken, isProxyActive, getProxyUrl, getProxyMode, getFetchRelayToken, isProxyEnabled, getProxyBypassPlatforms, probeProxyUrl, fetchRelayUrlError, DEFAULT_PROXY_PROBE_TARGET, PROXY_MODES, PROXY_SCHEMES } from '../lib/proxy.js';
+import { getProvider } from '../providers/index.js';
+import type { Platform } from '@freellmapi/shared/types.js';
+import type { ProxyMode } from '@freellmapi/shared/types.js';
 import { getSavedFusionConfig, setSavedFusionConfig, savedFusionConfigSchema, getFusionMaxK } from '../services/fusion.js';
 import { isUnifyEnabled, setUnifyEnabled, getUnifyOverrides, setUnifyOverrides, unifyOverridesSchema } from '../services/model-groups.js';
 import { getClaudeModelMap, setClaudeModelMap } from '../services/anthropic-map.js';
 import { getGeminiModelMap, setGeminiModelMap } from '../services/gemini-map.js';
 import { getOllamaEmulationMode } from './ollama.js';
+import { UPDATE_CHECK_SETTING, isAutoUpdateCheckEnabled } from './update.js';
 import { listUrlTokens, mintUrlToken, revokeUrlToken } from '../services/url-tokens.js';
 import {
   getRequestMaxTokensBudget,
@@ -19,8 +23,14 @@ import {
   getCompressionConfig,
   setCompressionConfig,
 } from '../services/compression/config.js';
+import { getHeadroomThresholds, setHeadroomThresholds } from '../services/router.js';
 import { z } from 'zod';
 import { getAppVersion } from '../lib/app-version.js';
+import {
+  UNIFIED_MAX_TOKENS_SETTING,
+  UNIFIED_MAX_TOKENS_AUTO,
+  unifiedMaxTokensCap,
+} from '../lib/sampling-params.js';
 
 export const settingsRouter = Router();
 
@@ -31,6 +41,31 @@ export const settingsRouter = Router();
 // dashboard then shows nothing rather than a number that isn't the release.
 settingsRouter.get('/version', (_req: Request, res: Response) => {
   res.json({ version: getAppVersion() });
+});
+
+// Opt-in for the dashboard's automatic release reminder (#782). Off unless the
+// operator turns it on: a self-hosted install must not contact GitHub on page
+// load on behalf of someone who never asked it to. The manual checker in
+// Settings is a separate surface and is unaffected by this flag.
+const updateCheckSchema = z.object({ enabled: z.boolean() }).strict();
+
+settingsRouter.get('/update-check', (_req: Request, res: Response) => {
+  res.json({ enabled: isAutoUpdateCheckEnabled() });
+});
+
+settingsRouter.put('/update-check', (req: Request, res: Response) => {
+  const parsed = updateCheckSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid update check setting: ${parsed.error.errors.map(error => error.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+  setSetting(UPDATE_CHECK_SETTING, parsed.data.enabled ? '1' : '0');
+  res.json({ enabled: isAutoUpdateCheckEnabled() });
 });
 
 settingsRouter.get('/compression', (_req: Request, res: Response) => {
@@ -190,6 +225,49 @@ settingsRouter.delete('/url-tokens/:id', (req: Request, res: Response) => {
   res.status(204).end();
 });
 
+// The unified output-token cap as the dashboard sees it. `mode` is exactly
+// what PUT accepts back — 'off', 'auto', or the integer itself, never a
+// stringified number — so a read/modify/write round trip can't 400 on its own
+// output. A stored value that unifiedMaxTokensCap() doesn't understand is
+// reported as 'off', which is how it actually behaves (effectiveCap null).
+function outputLimitState(): { mode: 'off' | 'auto' | number; effectiveCap: number | null; autoValue: number } {
+  const raw = (getSetting(UNIFIED_MAX_TOKENS_SETTING) ?? '').trim().toLowerCase();
+  const effectiveCap = unifiedMaxTokensCap();
+  const mode = raw === 'auto' ? 'auto' as const : (effectiveCap ?? 'off' as const);
+  return { mode, effectiveCap, autoValue: UNIFIED_MAX_TOKENS_AUTO };
+}
+
+// Get the unified output-token cap ('off' = disabled, 'auto' = 32768, or an
+// explicit integer). See lib/sampling-params.ts unifiedMaxTokensCap().
+settingsRouter.get('/output-limit', (_req: Request, res: Response) => {
+  res.json(outputLimitState());
+});
+
+const outputLimitPutSchema = z.object({
+  mode: z.union([
+    z.literal('off'),
+    z.literal('auto'),
+    z.number().int().min(1),
+  ]),
+});
+
+// Update the unified output-token cap. 'off' restores pass-through behaviour;
+// 'auto' clamps every request's max_tokens to UNIFIED_MAX_TOKENS_AUTO; an
+// integer clamps to that value. Takes effect on the next request.
+settingsRouter.put('/output-limit', (req: Request, res: Response) => {
+  const parsed = outputLimitPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors
+      .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+      .slice(0, 5)
+      .join(', ');
+    res.status(400).json({ error: { message: `Invalid output limit: ${detail}`, type: 'invalid_request_error' } });
+    return;
+  }
+  setSetting(UNIFIED_MAX_TOKENS_SETTING, String(parsed.data.mode));
+  res.json(outputLimitState());
+});
+
 // Get the request guardrails (per-request token budget + failover circuit
 // breaker). Both default to 0 = disabled; see lib/guardrails.ts.
 settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
@@ -202,6 +280,40 @@ settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
 const guardrailsPutSchema = z.object({
   requestMaxTokensBudget: z.number().int().min(0).optional(),
   maxConsecutiveUpstreamFails: z.number().int().min(0).optional(),
+});
+
+// Get the headroom guardrail thresholds (#899): the remaining-budget fraction
+// at which proactive demotion begins and the score floor at 0 remaining. Both
+// are decimals (0.2 = 20%). null = the scoring.ts default is in effect.
+settingsRouter.get('/headroom', (_req: Request, res: Response) => {
+  const { rampStart, floor } = getHeadroomThresholds();
+  res.json({ rampStart: rampStart ?? null, floor: floor ?? null });
+});
+
+const headroomPutSchema = z.object({
+  rampStart: z.number().min(0).max(1).nullable().optional(),
+  floor: z.number().min(0).max(1).nullable().optional(),
+});
+
+// Update the headroom guardrail thresholds. null clears a threshold back to the
+// scoring.ts default. Takes effect on the next request — no restart needed.
+settingsRouter.put('/headroom', (req: Request, res: Response) => {
+  const parsed = headroomPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors
+      .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+      .slice(0, 5)
+      .join(', ');
+    res.status(400).json({ error: { message: `Invalid headroom thresholds: ${detail}`, type: 'invalid_request_error' } });
+    return;
+  }
+  try {
+    setHeadroomThresholds(parsed.data.rampStart, parsed.data.floor);
+    const { rampStart, floor } = getHeadroomThresholds();
+    res.json({ rampStart: rampStart ?? null, floor: floor ?? null });
+  } catch (err: any) {
+    res.status(400).json({ error: { message: `Invalid headroom thresholds: ${err.message}`, type: 'invalid_request_error' } });
+  }
 });
 
 // Update the guardrails. Partial: send just the knob you want to change.
@@ -240,46 +352,84 @@ settingsRouter.post('/api-key/regenerate', (_req: Request, res: Response) => {
 settingsRouter.get('/proxy', (_req: Request, res: Response) => {
   res.json({
     proxyUrl: getProxyUrl(),
+    proxyMode: getProxyMode(),
+    fetchRelayTokenConfigured: Boolean(getFetchRelayToken()),
     enabled: isProxyEnabled(),
     bypassPlatforms: getProxyBypassPlatforms(),
     active: isProxyActive(),
   });
 });
 
-// Set the proxy settings. Accepts partial updates: proxyUrl, enabled, bypassPlatforms.
+// A forward proxy only tunnels the TLS session, so plain http to the proxy is
+// fine. A relay is the opposite: the provider API key and the relay token ride
+// inside the request it forwards, in the clear, so the hop to the relay has to
+// be https unless the relay is on this machine. fetchRelayUrlError owns that
+// rule and the boot-time env guard applies the same one.
+function proxyUrlError(proxyUrl: string, proxyMode: ProxyMode): string | undefined {
+  if (!proxyUrl) return undefined;
+  if (proxyMode === 'fetch-relay') return fetchRelayUrlError(proxyUrl);
+  try {
+    const protocol = new URL(proxyUrl).protocol;
+    if (!PROXY_SCHEMES.includes(protocol)) {
+      return 'Proxy URL must use http, https, socks5, socks5h, socks4, or socks4a scheme';
+    }
+  } catch {
+    return 'Invalid proxy URL — must be a valid URL like socks5://host:port';
+  }
+  return undefined;
+}
+
+// Set the proxy settings. Accepts partial updates.
 settingsRouter.put('/proxy', (req: Request, res: Response) => {
-  const { proxyUrl, enabled, bypassPlatforms } = req.body as {
+  const { proxyUrl, proxyMode, fetchRelayToken, enabled, bypassPlatforms } = req.body as {
     proxyUrl?: string;
+    proxyMode?: ProxyMode;
+    fetchRelayToken?: string;
     enabled?: boolean;
     bypassPlatforms?: string[];
   };
 
+  if (proxyMode !== undefined && !PROXY_MODES.includes(proxyMode)) {
+    res.status(400).json({
+      error: { message: 'Proxy mode must be forward or fetch-relay', type: 'invalid_request_error' },
+    });
+    return;
+  }
+
+  // Only validate the URL when this request actually decides it. A body that
+  // touches neither proxyUrl nor proxyMode — the enabled switch, the
+  // per-platform bypass list — must not 400 on an ambient ALL_PROXY value the
+  // dashboard never set and cannot fix (getProxyUrl may return exactly that).
+  if (typeof proxyUrl === 'string' || proxyMode !== undefined) {
+    const nextMode = proxyMode ?? getProxyMode();
+    const nextUrl = typeof proxyUrl === 'string' ? proxyUrl.trim() : getProxyUrl();
+    const urlError = proxyUrlError(nextUrl, nextMode);
+    if (urlError) {
+      res.status(400).json({ error: { message: urlError, type: 'invalid_request_error' } });
+      return;
+    }
+  }
+
   // --- proxyUrl ---
   if (typeof proxyUrl === 'string') {
     const trimmed = proxyUrl.trim();
-    if (trimmed) {
-      try {
-        const u = new URL(trimmed);
-        if (!PROXY_SCHEMES.includes(u.protocol)) {
-          res.status(400).json({
-            error: {
-              message: 'Proxy URL must use http, https, socks5, socks5h, socks4, or socks4a scheme',
-              type: 'invalid_request_error',
-            },
-          });
-          return;
-        }
-      } catch {
-        res.status(400).json({
-          error: { message: 'Invalid proxy URL — must be a valid URL like socks5://host:port', type: 'invalid_request_error' },
-        });
-        return;
-      }
-      setSetting('proxy_url', trimmed);
-    } else {
-      setSetting('proxy_url', '');
-    }
+    setSetting('proxy_url', trimmed);
     applyProxyUrl(trimmed);
+  }
+
+  // --- proxyMode ---
+  if (proxyMode !== undefined) {
+    setSetting('proxy_mode', proxyMode);
+    applyProxyMode(proxyMode);
+  }
+
+  // --- fetchRelayToken ---
+  // Never return this value from the API. Undefined retains the saved token;
+  // an explicit empty string clears it.
+  if (typeof fetchRelayToken === 'string') {
+    const trimmed = fetchRelayToken.trim();
+    setSetting('fetch_relay_token', encodeFetchRelayToken(trimmed));
+    applyFetchRelayToken(trimmed);
   }
 
   // --- enabled ---
@@ -297,8 +447,80 @@ settingsRouter.put('/proxy', (req: Request, res: Response) => {
 
   res.json({
     proxyUrl: getProxyUrl(),
+    proxyMode: getProxyMode(),
+    fetchRelayTokenConfigured: Boolean(getFetchRelayToken()),
     enabled: isProxyEnabled(),
     bypassPlatforms: getProxyBypassPlatforms(),
     active: isProxyActive(),
   });
+});
+
+// Test proxy connectivity WITHOUT saving (#863). The dashboard's "Test" button
+// sends the DRAFT value; an empty body falls back to the saved proxy URL. The
+// probe never persists anything — it only builds a throwaway dispatcher and
+// measures a round trip through the (draft or saved) proxy.
+/**
+ * What the proxy probe should call.
+ *
+ * The question the Test button answers is "can outbound traffic from THIS
+ * install reach the upstreams it routes to", so the target is the /models
+ * endpoint of a provider the operator actually holds an enabled key for —
+ * preferring one that is not bypassing the proxy, since a bypassed platform
+ * would not exercise the proxy at all. PROXY_TEST_URL overrides everything for
+ * air-gapped or mirror-only deployments. With no keys at all there is no
+ * upstream to name, and only then does the neutral fallback apply.
+ */
+function proxyProbeTarget(): string {
+  const override = (process.env.PROXY_TEST_URL ?? '').trim();
+  if (override) return override;
+
+  let platforms: { platform: string }[] = [];
+  try {
+    platforms = getDb().prepare(
+      `SELECT DISTINCT platform FROM api_keys WHERE enabled = 1 ORDER BY platform`,
+    ).all() as { platform: string }[];
+  } catch {
+    return DEFAULT_PROXY_PROBE_TARGET;
+  }
+
+  const bypassed = new Set(getProxyBypassPlatforms());
+  const candidates = [
+    ...platforms.filter(row => !bypassed.has(row.platform)),
+    ...platforms.filter(row => bypassed.has(row.platform)),
+  ];
+  for (const row of candidates) {
+    // 'custom' has no single registered base URL, and a provider may expose no
+    // OpenAI-style catalog route at all; skip rather than invent one.
+    if (row.platform === 'custom') continue;
+    const url = (getProvider(row.platform as Platform) as { modelsUrl?: string } | undefined)?.modelsUrl;
+    if (typeof url === 'string' && /^https?:\/\//i.test(url)) return url;
+  }
+  return DEFAULT_PROXY_PROBE_TARGET;
+}
+
+settingsRouter.post('/proxy/test', async (req: Request, res: Response) => {
+  const { proxyUrl, proxyMode, fetchRelayToken } = (req.body ?? {}) as {
+    proxyUrl?: string;
+    proxyMode?: ProxyMode;
+    fetchRelayToken?: string;
+  };
+  if (proxyMode !== undefined && !PROXY_MODES.includes(proxyMode)) {
+    res.status(400).json({ error: { message: 'Proxy mode must be forward or fetch-relay', type: 'invalid_request_error' } });
+    return;
+  }
+  const mode = proxyMode ?? getProxyMode();
+  const url = (proxyUrl ?? '').trim() || getProxyUrl();
+  const urlError = proxyUrlError(url, mode);
+  if (urlError) {
+    res.status(400).json({ error: { message: urlError, type: 'invalid_request_error' } });
+    return;
+  }
+  const result = await probeProxyUrl(proxyUrl, {
+    targetUrl: proxyProbeTarget(),
+    mode,
+    relayToken: typeof fetchRelayToken === 'string' && fetchRelayToken.trim()
+      ? fetchRelayToken.trim()
+      : getFetchRelayToken(),
+  });
+  res.json(result);
 });

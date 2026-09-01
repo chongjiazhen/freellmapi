@@ -9,8 +9,15 @@ export function getActiveProfileId(db: Db): number | null {
   return profile ? profileId : null;
 }
 
+// Only chains that still opt in to the backfill (#895). A chain created with
+// `empty: true` — or one the operator later switched the flag off on — holds
+// exactly what was put in it, and a catalog sync must not quietly refill it.
+const AUTO_INCLUDING_PROFILES_SQL = `
+  SELECT id FROM profiles WHERE auto_include_new_models = 1 ORDER BY id ASC
+`;
+
 export function ensureModelInProfiles(db: Db, modelDbId: number): void {
-  const profiles = db.prepare('SELECT id FROM profiles ORDER BY id ASC').all() as { id: number }[];
+  const profiles = db.prepare(AUTO_INCLUDING_PROFILES_SQL).all() as { id: number }[];
   const fallback = db.prepare('SELECT enabled FROM fallback_config WHERE model_db_id = ?').get(modelDbId) as { enabled: number } | undefined;
   if (!fallback) return;
 
@@ -26,7 +33,7 @@ export function ensureModelInProfiles(db: Db, modelDbId: number): void {
 }
 
 export function ensureAllModelsInProfiles(db: Db): void {
-  const profiles = db.prepare('SELECT id FROM profiles ORDER BY id ASC').all() as { id: number }[];
+  const profiles = db.prepare(AUTO_INCLUDING_PROFILES_SQL).all() as { id: number }[];
   if (profiles.length === 0) return;
 
   const missing = db.prepare(`

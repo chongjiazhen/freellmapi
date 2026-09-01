@@ -7,6 +7,7 @@ import { CloudflareProvider } from './cloudflare.js';
 import { AIHordeProvider } from './aihorde.js';
 import { ModelScopeProvider } from './modelscope.js';
 import { PollinationsProvider } from './pollinations.js';
+import { ZhipuProvider } from './zhipu.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -31,6 +32,35 @@ register(new OpenAICompatProvider({
   platform: 'cerebras',
   name: 'Cerebras',
   baseUrl: 'https://api.cerebras.ai/v1',
+}));
+
+// B.AI — OpenAI-compatible gateway. Provider support is first-class, but the
+// only free catalog row currently published is a limited-time 0-credit promo;
+// keep commercial eligibility in the hosted catalog rather than seeding it.
+register(new OpenAICompatProvider({
+  platform: 'bai',
+  name: 'B.AI',
+  baseUrl: 'https://api.b.ai/v1',
+}));
+
+// AnyAPI - OpenAI-compatible gateway (anyapi.ai). Free tier (checked against
+// anyapi.ai/pricing 2026-08-10): $0, no card, recurring — but the binding limit
+// is 100K TOKENS PER DAY, and only "free and basic" models are in scope. AnyAPI
+// publishes no RPM/RPD numbers at all; the 20 RPM / 200 RPD figures in #732 are
+// OpenRouter's, not AnyAPI's, so nothing here asserts a request rate.
+//
+// Model rows are NOT seeded here or in migrations — they are authored in the
+// hosted catalog and arrive via catalog-sync once the platform is registered
+// (see services/catalog-sync.ts, which gates on hasProvider). The ids proposed
+// in #732 (meta-llama/llama-3.3-70b-instruct:free, qwen/qwen3-coder:free,
+// nvidia/nemotron-3-ultra-550b-a55b:free, google/gemma-4-26b-a4b-it:free) came
+// from a third-party list and are UNVERIFIED against the live /v1/models, which
+// needs a key; treat them as candidates for catalog authoring, where a bad id
+// is caught by the health check instead of shipped as a default.
+register(new OpenAICompatProvider({
+  platform: 'anyapi',
+  name: 'AnyAPI',
+  baseUrl: 'https://api.anyapi.ai/v1',
 }));
 
 // SambaNova was dropped in V23 (June 2026): the free tier is permanently gone.
@@ -87,19 +117,18 @@ register(new CohereProvider());
 // Cloudflare Workers AI - OpenAI-compatible endpoint (key = "account_id:token")
 register(new CloudflareProvider());
 
-// Zhipu (Z.ai / bigmodel.cn) - OpenAI-compatible
+// Zhipu (Z.ai / bigmodel.cn) - OpenAI-compatible. ZhipuProvider is stock
+// openai-compat chat routing plus console autodetect: the domestic
+// open.bigmodel.cn host stays the default, and a key it rejects is re-probed
+// against the global api.z.ai host during validation instead of being written
+// off as invalid (the two consoles don't share a key namespace).
 //
 // glm-4.7-flash is a hidden-reasoning model: it burns through a long
 // reasoning_content before the first answer byte (live-probed 41s TTFB on a
 // one-word completion, 2026-07-11), and Zhipu buffers that phase even when
 // streaming — so the default 15s timeout aborted every attempt. 60s covers
 // the observed worst case with headroom.
-register(new OpenAICompatProvider({
-  platform: 'zhipu',
-  name: 'Zhipu AI',
-  baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
-  timeoutMs: 60_000,
-}));
+register(new ZhipuProvider({ timeoutMs: 60_000 }));
 
 // Hugging Face Inference Providers router — re-added in V13. The V4 removal
 // reason ("tool-call format issues") was the legacy serverless route that
@@ -334,6 +363,59 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://api.sea-lion.ai/v1',
 }));
 
+// OrcaRouter — OpenAI-compatible aggregator (api.orcarouter.ai/v1). Free key
+// from orcarouter.ai (no card, `sk-orca-` prefix). Recurring rate-limited free
+// aliases at $0 (`*-free` ids plus the `orcarouter/free` auto route); limits
+// are intentionally unpublished (429 on cap) and free routes never fall back
+// to paid models, so a 429 is a clean quota signal, not a wallet risk.
+// Live-verified 2026-08-15. Catalog rows live in the Oracle catalog (premium
+// now, free after the 30-day model-age gate).
+register(new OpenAICompatProvider({
+  platform: 'orcarouter',
+  name: 'OrcaRouter',
+  baseUrl: 'https://api.orcarouter.ai/v1',
+}));
+
+// UnoRouter (unorouter.com) — OpenAI-compatible aggregator. The web app is a
+// Next.js site at unorouter.com (which redirects /v1/* to the marketing app,
+// NOT the API); the real API is api.unorouter.com/v1. Free key from
+// unorouter.com (no card); free models carry a `:free` suffix and a per-minute
+// rate limit (429 on cap — "1 request(s) every 1 min per account on <model>").
+// Live-probed 2026-08-23: GET /v1/models is public (200 with no key) but
+// answers 401 "Invalid token" to a wrong key, and chat/completions is 401
+// without a key — so the default /v1/models key validation (which sends the
+// key) is a real check; no validateUrl override needed. A burst of parallel
+// requests trips an account-wide 429 on every :free model for several
+// minutes, which is why provider-quota pools the platform as one allowance.
+// Catalog rows live in the hosted catalog (premium now, free after the 30-day
+// model-age gate).
+register(new OpenAICompatProvider({
+  platform: 'unorouter',
+  name: 'UnoRouter',
+  baseUrl: 'https://api.unorouter.com/v1',
+}));
+
+// xKiro (xkiro.com) — OpenAI-compatible gateway at api.xkiro.com/v1 (the
+// apex serves the same API today, but the docs name api.). Free key from
+// xkiro.com (no card). Live-probed 2026-08-23 with a free-plan key: /v1/usage
+// reports free_tokens limit_per_day=5,000,000; paid models answer an instant
+// 403 "premium model"/"requires a paid account", free ones (Mistral, MiniMax,
+// DeepSeek families) answer normally, Qwen was 503 upstream.
+// GET /v1/models answers 200 with NO key (public
+// catalog), so the default /v1/models key validation would be a false
+// positive — validateUrl points at /v1/usage instead, which 401s on a missing
+// or invalid ClientApiKey ("Invalid or disabled ClientApiKey"). Accepts
+// Authorization: Bearer or x-api-key. Catalog rows live in the hosted catalog
+// (premium now, free after the 30-day model-age gate); the ids in #947 are
+// unverified against a live account and are candidates for catalog authoring,
+// where a bad id is caught by the health check instead of shipped as a default.
+register(new OpenAICompatProvider({
+  platform: 'xkiro',
+  name: 'xKiro',
+  baseUrl: 'https://api.xkiro.com/v1',
+  validateUrl: 'https://api.xkiro.com/v1/usage',
+}));
+
 // ModelScope (魔搭社区, Alibaba) — OpenAI-compatible inference API
 // (api-inference.modelscope.cn/v1, Bearer auth). Free tier: 2000 requests/day
 // account-wide. Token from modelscope.cn/my/myaccesstoken, BUT calls only work
@@ -352,6 +434,46 @@ register(new OpenAICompatProvider({
 // retired ids out of the catalog instead; the quota-header path in
 // provider-quota.ts keys on response headers, never on that message text.
 register(new ModelScopeProvider());
+
+// ── Chinese domestic providers (#922/#923/#924) ─────────────────────────────
+// Plain OpenAI-compatible Bearer endpoints, so no dedicated provider class is
+// needed. Every one of these requires Chinese real-name verification on the
+// cloud account before a key serves traffic (LongCat aside — it takes an email
+// signup from outside mainland China). Catalog rows live in the hosted catalog,
+// never in a migration, so a free user cannot pick them up from a binary
+// upgrade ahead of the premium window.
+
+// Baidu Qianfan (百度千帆). ERNIE-Speed / ERNIE-Lite / ERNIE-Tiny are free via
+// pay-as-you-go billing, bounded by rate limits rather than a token balance.
+register(new OpenAICompatProvider({
+  platform: 'qianfan',
+  name: 'Baidu Qianfan',
+  baseUrl: 'https://qianfan.baidubce.com/v2',
+}));
+
+// Volcengine Ark (火山方舟, ByteDance). Doubao models on a recurring daily
+// per-model free reward quota (2M tokens/day/model for individual developers).
+register(new OpenAICompatProvider({
+  platform: 'volcengine',
+  name: 'Volcengine Ark',
+  baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+}));
+
+// LongCat (Meituan / 美团). Daily free quota; the platform also speaks the
+// Anthropic wire format at /anthropic, which we do not use here.
+register(new OpenAICompatProvider({
+  platform: 'longcat',
+  name: 'LongCat',
+  baseUrl: 'https://api.longcat.chat/openai/v1',
+}));
+
+// iFlytek Spark (讯飞星火). Auth is the console APIPassword as a Bearer token;
+// the Lite model is the free one.
+register(new OpenAICompatProvider({
+  platform: 'xfyun',
+  name: 'iFlytek Spark',
+  baseUrl: 'https://spark-api-open.xf-yun.com/v1',
+}));
 
 // AI Horde — free, community-powered inference (volunteer workers) via an
 // OpenAI-compatible proxy. Dedicated AIHordeProvider (not OpenAICompatProvider)

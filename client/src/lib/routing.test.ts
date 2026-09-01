@@ -6,6 +6,8 @@ import {
   memberProviderLabel,
   providerPinId,
   splitsWithoutMember,
+  tightestRateLimit,
+  type RateLimitUsageRow,
 } from './routing'
 
 // Per-endpoint identity must be INVISIBLE until two endpoints actually serve the
@@ -162,5 +164,99 @@ describe('pre-#651 split overrides stay undoable', () => {
 
   it('leaves catalog rows on the plain form only', () => {
     expect(isMemberSplit([{ member: 'groq:llama-3.3-70b' }], catalog)).toBe(true)
+  })
+})
+
+// ── Group-level rate-limit badge (#876, #921 follow-up) ──────────────────────
+// The badge means "how close is this logical model to being unusable". A model
+// is unusable only when EVERY provider serving it is out of headroom, so the
+// group number follows the BEST member. Taking the worst member painted a
+// five-provider group red the moment one provider ran dry.
+
+function usageRow(modelDbId: number, w: Partial<Pick<RateLimitUsageRow, 'rpm' | 'rpd' | 'tpm'>> = {}): RateLimitUsageRow {
+  return {
+    modelDbId,
+    platform: 'p' + modelDbId,
+    modelId: 'm' + modelDbId,
+    rpm: w.rpm ?? null,
+    rpd: w.rpd ?? null,
+    tpm: w.tpm ?? null,
+  }
+}
+
+describe('tightestRateLimit', () => {
+  it('returns null with no rows at all', () => {
+    expect(tightestRateLimit([])).toBeNull()
+  })
+
+  it('returns null when every window is idle (no badge for an unused model)', () => {
+    expect(tightestRateLimit([usageRow(1, { rpm: { used: 0, limit: 30 } })])).toBeNull()
+  })
+
+  it('returns null when rows carry no windows at all (model has no limits)', () => {
+    expect(tightestRateLimit([usageRow(1)])).toBeNull()
+  })
+
+  it('reports a single member as-is', () => {
+    expect(tightestRateLimit([usageRow(1, { rpm: { used: 21, limit: 30 } })]))
+      .toEqual({ kind: 'RPM', used: 21, limit: 30 })
+  })
+
+  it('within one member picks the TIGHTEST window (that member is blocked by it)', () => {
+    const row = usageRow(1, {
+      rpm: { used: 3, limit: 30 },     // 10%
+      rpd: { used: 900, limit: 1000 }, // 90% ← binding
+      tpm: { used: 100, limit: 1000 }, // 10%
+    })
+    expect(tightestRateLimit([row])).toEqual({ kind: 'RPD', used: 900, limit: 1000 })
+  })
+
+  it('across a group picks the member with the MOST headroom, not the exhausted one', () => {
+    const exhausted = usageRow(1, { rpm: { used: 30, limit: 30 } })
+    const easy = usageRow(2, { rpm: { used: 2, limit: 30 } })
+    expect(tightestRateLimit([exhausted, easy])).toEqual({ kind: 'RPM', used: 2, limit: 30 })
+  })
+
+  it('one exhausted provider out of five does not decide the badge', () => {
+    const rows = [
+      usageRow(1, { rpd: { used: 1000, limit: 1000 } }),
+      usageRow(2, { rpd: { used: 10, limit: 1000 } }),
+      usageRow(3, { rpd: { used: 50, limit: 1000 } }),
+      usageRow(4, { rpd: { used: 5, limit: 1000 } }),
+      usageRow(5, { rpd: { used: 400, limit: 1000 } }),
+    ]
+    expect(tightestRateLimit(rows)).toEqual({ kind: 'RPD', used: 5, limit: 1000 })
+  })
+
+  it('goes red only when every member is exhausted', () => {
+    const rows = [
+      usageRow(1, { rpm: { used: 30, limit: 30 } }),
+      usageRow(2, { rpm: { used: 60, limit: 60 } }),
+    ]
+    const tight = tightestRateLimit(rows)!
+    expect(tight.used / tight.limit).toBe(1)
+  })
+
+  it('a fully idle member wins over a busy one and suppresses the badge', () => {
+    const rows = [
+      usageRow(1, { rpm: { used: 29, limit: 30 } }),
+      usageRow(2, { rpm: { used: 0, limit: 30 } }),
+    ]
+    expect(tightestRateLimit(rows)).toBeNull()
+  })
+
+  it('ignores a zero limit rather than dividing by it', () => {
+    const rows = [usageRow(1, { rpm: { used: 5, limit: 0 } })]
+    expect(tightestRateLimit(rows)).toBeNull()
+  })
+
+  it('compares members by ratio, not by raw counts', () => {
+    // 500/100000 (0.5%) has far more headroom than 8/10 (80%), despite the
+    // bigger absolute number.
+    const rows = [
+      usageRow(1, { rpm: { used: 8, limit: 10 } }),
+      usageRow(2, { tpm: { used: 500, limit: 100_000 } }),
+    ]
+    expect(tightestRateLimit(rows)).toEqual({ kind: 'TPM', used: 500, limit: 100_000 })
   })
 })

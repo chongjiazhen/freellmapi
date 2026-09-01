@@ -9,7 +9,9 @@ export interface CatalogModel {
 export interface GeneratedFile {
   path: string;
   format: 'json' | 'toml' | 'yaml' | 'env';
+  /** Structured patch, deep-merged into the existing document (json, yaml). */
   value?: Record<string, unknown>;
+  /** Literal text, merged as a marked `# freellmapi:start/end` block (toml, yaml, env). */
   content?: string;
   sensitive?: boolean;
 }
@@ -20,6 +22,9 @@ export interface GenerateContext {
   profile: string;
   models: CatalogModel[];
   homeDir: string;
+  /** An explicit `--model`. Overrides each generator's default-model
+   *  heuristic; validated against the unfiltered catalog by the caller. */
+  requestedModelId?: string;
 }
 
 export interface Generation {

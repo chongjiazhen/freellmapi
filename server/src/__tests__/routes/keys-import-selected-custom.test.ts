@@ -14,7 +14,8 @@ import { mintDashboardToken } from '../helpers/auth.js';
 let dashToken = '';
 
 async function post(app: Express, path: string, body: unknown) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -27,7 +28,8 @@ async function post(app: Express, path: string, body: unknown) {
 }
 
 async function previewFile(app: Express, filename: string, content: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as { port: number };
   const form = new FormData();
   form.append('files', new Blob([content], { type: 'text/plain' }), filename);

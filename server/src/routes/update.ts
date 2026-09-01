@@ -2,12 +2,23 @@ import { execFile as nodeExecFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
+import { getSetting } from '../db/index.js';
 import { getAppVersion } from '../lib/app-version.js';
 
 const execFileAsync = promisify(nodeExecFile);
 
 const REPOSITORY = 'tashfeenahmed/freellmapi';
+const RELEASES_URL = `https://github.com/${REPOSITORY}/releases`;
 const CACHE_TTL_MS = 5 * 60 * 1000;
+/**
+ * The automatic release check is opt-in (see UPDATE_CHECK_SETTING), and even
+ * once enabled a dashboard reload must not become an outbound request. Six
+ * hours means at most four calls a day regardless of how often the operator
+ * reloads, or how many browsers point at the same install.
+ */
+const RELEASE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MAX_RELEASE_BODY_LENGTH = 20_000;
+const MAX_TAG_LENGTH = 64;
 // Failures are cached too, briefly. Without this a box that cannot reach GitHub
 // re-dials the API and then the Atom feed on every single click.
 const FAILURE_TTL_MS = 45 * 1000;
@@ -54,6 +65,31 @@ interface CachedResult {
   cachedAt: number;
 }
 
+/**
+ * Settings-table key for the dashboard's automatic release check (#782).
+ * Absent or anything other than '1' means off, so an install that has never
+ * been told otherwise never phones GitHub on its own. The manual checker above
+ * is a separate surface and stays available regardless.
+ */
+export const UPDATE_CHECK_SETTING = 'update_check_enabled';
+
+export function isAutoUpdateCheckEnabled(): boolean {
+  return getSetting(UPDATE_CHECK_SETTING) === '1';
+}
+
+/** The GitHub latest release, reduced to what the dashboard reminder renders. */
+interface LatestRelease {
+  tagName: string;
+  body: string | null;
+  htmlUrl: string;
+  publishedAt: string | null;
+}
+
+interface CachedRelease {
+  result: LatestRelease;
+  cachedAt: number;
+}
+
 type ExecFile = (
   file: string,
   args: string[],
@@ -68,6 +104,8 @@ export interface UpdateRouterOptions {
   now?: () => number;
   logger?: Pick<Console, 'error'>;
   version?: () => string | null;
+  /** Reads the opt-in flag; injectable so the endpoint is testable without a DB. */
+  autoCheckEnabled?: () => boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -301,6 +339,7 @@ export function createUpdateRouter(options: UpdateRouterOptions = {}): Router {
   const now = options.now ?? Date.now;
   const logger = options.logger ?? console;
   const appVersion = options.version ?? getAppVersion;
+  const autoCheckEnabled = options.autoCheckEnabled ?? isAutoUpdateCheckEnabled;
   const updateCheckDisabled = env.FREELLMAPI_UPDATE_CHECK?.trim().toLowerCase() === 'off';
   const githubToken = env.FREELLMAPI_UPDATE_GITHUB_TOKEN?.trim();
 
@@ -308,6 +347,18 @@ export function createUpdateRouter(options: UpdateRouterOptions = {}): Router {
   let cache: CachedResult | null = null;
   let failedAt: number | null = null;
   let inFlight: Promise<CheckResult> | null = null;
+  let releaseCache: CachedRelease | null = null;
+  let releaseFailedAt: number | null = null;
+  let releaseInFlight: Promise<LatestRelease> | null = null;
+
+  function githubHeaders(accept: string): Record<string, string> {
+    return {
+      Accept: accept,
+      'User-Agent': 'freellmapi-update-checker',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
+    };
+  }
 
   // Lazily resolved, and asynchronously: `git rev-parse` used to run through
   // execFileSync inside the request handler, which blocked the event loop for
@@ -353,12 +404,7 @@ export function createUpdateRouter(options: UpdateRouterOptions = {}): Router {
     };
     const url = `https://api.github.com/repos/${REPOSITORY}/compare/${currentIdentity.sha}...main`;
     const response = await fetchImpl(url, {
-      headers: {
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'freellmapi-update-checker',
-        'X-GitHub-Api-Version': '2022-11-28',
-        ...(githubToken ? { Authorization: `Bearer ${githubToken}` } : {}),
-      },
+      headers: githubHeaders('application/vnd.github+json'),
       signal: AbortSignal.timeout(10_000),
     });
 
@@ -426,6 +472,90 @@ export function createUpdateRouter(options: UpdateRouterOptions = {}): Router {
     inFlight = request;
     return request;
   }
+
+  async function performReleaseCheck(): Promise<LatestRelease> {
+    const response = await fetchImpl(`https://api.github.com/repos/${REPOSITORY}/releases/latest`, {
+      headers: githubHeaders('application/vnd.github+json'),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) {
+      throw new Error(`GitHub latest-release request returned HTTP ${response.status}`);
+    }
+
+    const body: unknown = await response.json();
+    if (!isRecord(body)) throw new Error('GitHub latest-release response is not an object');
+    if (typeof body.tag_name !== 'string' || body.tag_name.trim().length === 0) {
+      throw new Error('GitHub latest-release response has no tag');
+    }
+
+    // The release notes are rendered as Markdown in the dashboard, so the body
+    // is capped rather than trusted at whatever length GitHub returns, and the
+    // link is only honoured when it points back at this repository.
+    const htmlUrl = typeof body.html_url === 'string' && body.html_url.startsWith(`${RELEASES_URL}/`)
+      ? body.html_url
+      : RELEASES_URL;
+
+    return {
+      tagName: body.tag_name.trim().slice(0, MAX_TAG_LENGTH),
+      body: typeof body.body === 'string' ? body.body.slice(0, MAX_RELEASE_BODY_LENGTH) : null,
+      htmlUrl,
+      publishedAt: validDate(body.published_at) ? body.published_at : null,
+    };
+  }
+
+  function latestRelease(): Promise<LatestRelease> {
+    const currentTime = now();
+    if (releaseCache && currentTime - releaseCache.cachedAt < RELEASE_CACHE_TTL_MS) {
+      return Promise.resolve(releaseCache.result);
+    }
+    if (releaseFailedAt !== null && currentTime - releaseFailedAt < FAILURE_TTL_MS) {
+      return Promise.reject(new Error('GitHub release check failed recently'));
+    }
+    if (releaseInFlight) return releaseInFlight;
+
+    const request = performReleaseCheck()
+      .then((result) => {
+        releaseCache = { result, cachedAt: now() };
+        releaseFailedAt = null;
+        return result;
+      })
+      .catch((error: unknown) => {
+        releaseFailedAt = now();
+        logger.error('[update] GitHub latest-release check failed', error);
+        throw error;
+      })
+      .finally(() => {
+        if (releaseInFlight === request) releaseInFlight = null;
+      });
+    releaseInFlight = request;
+    return request;
+  }
+
+  /**
+   * The latest published release, for the dashboard's automatic reminder (#782).
+   *
+   * The browser cannot ask GitHub itself — the CSP this server sends is
+   * `connect-src 'self'`, so a direct fetch to api.github.com is blocked on
+   * every web install. Routing it through here also means the opt-in is
+   * enforced where it cannot be bypassed: when the check is off nothing leaves
+   * the box, not even a request that is thrown away afterwards.
+   */
+  router.get('/release', async (_req: Request, res: Response) => {
+    if (updateCheckDisabled || !autoCheckEnabled()) {
+      return res.json({ disabled: true });
+    }
+
+    try {
+      return res.json(await latestRelease());
+    } catch {
+      return res.status(502).json({
+        error: {
+          message: 'Unable to check for the latest release',
+          type: 'upstream_error',
+        },
+      });
+    }
+  });
 
   router.get('/check', async (_req: Request, res: Response) => {
     if (updateCheckDisabled) {

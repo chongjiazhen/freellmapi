@@ -31,7 +31,9 @@ import {
 import { routedViaValue } from './header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from './guardrails.js';
 import { contentToString } from './content.js';
+import { normalizeMessageImages } from './image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from './tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from './tool-validate.js';
 import {
   containsDialectMarker,
   couldBecomeDialectMarker,
@@ -39,7 +41,7 @@ import {
   startsWithDialectMarker,
 } from './tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from './error-redaction.js';
-import { newClientAbortError } from './error-classify.js';
+import { newClientAbortError, isUpstreamClassificationOutput } from './error-classify.js';
 import { logRequest } from './request-log.js';
 import { getStickyModel, setStickyModel } from '../routes/proxy.js';
 import type { CompletionOptions } from '../providers/base.js';
@@ -174,6 +176,10 @@ export async function runInboundChat(
   wire: InboundChatWire,
 ): Promise<void> {
   const start = Date.now();
+  // Downscale over-threshold inline images BEFORE estimation and routing so
+  // token budgets, payload limits, and upstream transfers all see the shrunk
+  // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
+  await normalizeMessageImages(input.messages);
   const estimatedInputTokens = estimateTokens(input.messages);
   const budget = applyTokenBudget(estimatedInputTokens, input.maxTokens);
   if (budget.rejection) {
@@ -195,7 +201,11 @@ export async function runInboundChat(
   const attemptLog: AttemptRecord[] = [];
   const wantsTools = (input.tools?.length ?? 0) > 0;
   const imageRequest = hasImages(input.messages);
-  const estimatedTotal = estimatedInputTokens + routingReserveTokens(maxTokens);
+  // Capped reserve (#470); threaded to the router separately because it is an
+  // exact count and must not be inflated by the context-window safety margin
+  // (#956 review).
+  const outputReserve = routingReserveTokens(maxTokens);
+  const estimatedTotal = estimatedInputTokens + outputReserve;
   const schemas = toolSchemaMap(input.tools);
   let clientGone = false;
   const clientAbort = new AbortController();
@@ -233,6 +243,8 @@ export async function runInboundChat(
       state.skipModels.size ? state.skipModels : undefined,
       pin.strictChain,
       input.responseFormat !== undefined,
+      state.skipPlatforms.size ? state.skipPlatforms : undefined,
+      outputReserve,
     ),
     dispatch: async (route, attempt) => {
       if (!input.stream) {
@@ -249,6 +261,15 @@ export async function runInboundChat(
         if (!text && !reasoning && toolCalls.length === 0) {
           throw Object.assign(
             new Error(`empty completion from ${route.displayName}`),
+            result.choices?.[0]?.finish_reason === 'length' ? { skipBench: true } : {},
+          );
+        }
+        // #809: a bare "safe"/"unsafe" classification word from a relay is an
+        // upstream filter, not the requested model — fail over like an empty
+        // completion.
+        if (isUpstreamClassificationOutput(text, route.platform) && toolCalls.length === 0) {
+          throw Object.assign(
+            new Error(`empty completion from ${route.displayName} (upstream classification output)`),
             result.choices?.[0]?.finish_reason === 'length' ? { skipBench: true } : {},
           );
         }
@@ -280,6 +301,12 @@ export async function runInboundChat(
             call.function.arguments,
             schemas.get(call.function.name),
           );
+        }
+        // Opt-in schema verdict on what the repair could not fix. Nothing has
+        // been written yet on this path, so the failover hop is invisible.
+        if (isToolArgumentValidationEnabled() && toolCalls.length > 0) {
+          const invalid = invalidToolCallReasons(toolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
         }
         const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
         const completionTokens = result.usage?.completion_tokens
@@ -427,6 +454,15 @@ export async function runInboundChat(
             },
             ...(call.thoughtSignature ? { thought_signature: call.thoughtSignature } : {}),
           }));
+        // Opt-in schema verdict, before the tool calls are committed. Tool
+        // calls are buffered to the end of the stream on this path, so a
+        // tool-only turn has sent nothing yet and can still fail over. A turn
+        // that already streamed text is past its commit point — leave it
+        // alone rather than tearing down a stream the client is reading.
+        if (isToolArgumentValidationEnabled() && toolCalls.length > 0 && !committed) {
+          const invalid = invalidToolCallReasons(toolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+        }
         if (toolCalls.length) {
           commit();
           wire.sendToolCalls?.(res, route, toolCalls);
@@ -439,6 +475,16 @@ export async function runInboundChat(
           if (clientGone) return 'committed';
           throw Object.assign(
             new Error(`empty completion from ${route.displayName}`),
+            finishReason === 'length' ? { skipBench: true } : {},
+          );
+        }
+        // #809: bare "safe"/"unsafe" classification output from a relay is an
+        // upstream filter, not the requested model — fail over like an empty
+        // completion.
+        if (isUpstreamClassificationOutput(text, route.platform) && toolCalls.length === 0) {
+          if (clientGone) return 'committed';
+          throw Object.assign(
+            new Error(`empty completion from ${route.displayName} (upstream classification output)`),
             finishReason === 'length' ? { skipBench: true } : {},
           );
         }

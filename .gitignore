@@ -19,6 +19,9 @@ docker/tiers/clean.config.json
 docker/tiers/gray.config.json
 .DS_Store
 
+# TypeScript incremental build cache
+*.tsbuildinfo
+
 # Personal deployment scripts (contain keys/credentials — kept local)
 deploy-pi.sh
 update-hermes.sh

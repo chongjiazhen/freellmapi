@@ -2,6 +2,7 @@
 
 import { getDb } from '../db/index.js';
 import { isLoopbackOrPrivateUrl } from '../lib/url-guard.js';
+import { parseModelScope, scopeAllows } from '../lib/model-scope.js';
 
 interface Window {
   timestamps: number[];
@@ -192,6 +193,18 @@ function provisionalProviderTokens(platform: string, keyId: number, now: number)
   return total;
 }
 
+// Retention sweep for rate_limit_usage. The only index on the table is
+// idx_rate_limit_usage_lookup(platform, model_id, key_id, kind, created_at_ms),
+// which a bare `created_at_ms <= ?` predicate cannot use — the prune is a full
+// table scan. Running it inside every insert put that scan on the hot request
+// path, so it is throttled: rows are kept for a DAY and every counter query is
+// bounded by its own `created_at_ms > ?` filter, so letting expired rows linger
+// for up to a minute costs nothing but a few stale rows.
+const USAGE_PRUNE_INTERVAL_MS = MINUTE;
+let lastUsagePruneMs = 0;
+
+/** True when the row actually reached the DB. Callers use this to decide
+ *  whether the in-memory windows have to carry the count instead. */
 function recordUsage(
   platform: string,
   modelId: string,
@@ -199,14 +212,21 @@ function recordUsage(
   kind: UsageKind,
   tokens: number,
   now: number,
-) {
-  withDb(db => {
+): boolean {
+  return withDb(db => {
     db.prepare(`
       INSERT INTO rate_limit_usage (platform, model_id, key_id, kind, tokens, created_at_ms)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(platform, modelId, keyId, kind, tokens, now);
-    db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
-  });
+    // `now < lastUsagePruneMs` covers a clock step backwards (NTP correction,
+    // a suspended host resuming) — without it a jump forward would wedge the
+    // prune off until real time caught up again.
+    if (now - lastUsagePruneMs >= USAGE_PRUNE_INTERVAL_MS || now < lastUsagePruneMs) {
+      lastUsagePruneMs = now;
+      db.prepare('DELETE FROM rate_limit_usage WHERE created_at_ms <= ?').run(now - DAY);
+    }
+    return true;
+  }) ?? false;
 }
 
 function countPersistedRequests(
@@ -333,6 +353,199 @@ export function canUseTokens(
   }
 
   return true;
+}
+
+// ── Window utilization for the routing guardrail (#899) ──────────────────────
+// Everything above answers a yes/no question on the hot path: may THIS key
+// serve THIS request. The router also needs a graded one — "how much of its
+// window quota has this model already burned" — so it can steer traffic away
+// from a model at 95% of its daily cap before that cap actually rejects
+// anything. See rateWindowHeadroomFactor in scoring.ts for what is done with
+// the number.
+//
+// Cost is the whole design constraint: this runs per chain entry per request,
+// and the naive shape is four counts per model × key. So it is one grouped scan
+// of rate_limit_usage plus one read of api_keys, memoised for a few seconds and
+// shared by every entry of every chain — the same trade getKeyQuotaHeadroom
+// makes in provider-quota.ts. Per-entry work is then pure in-memory arithmetic
+// over the model's own limit columns, which the router already has in hand.
+
+export interface WindowLimits {
+  rpm: number | null;
+  rpd: number | null;
+  tpm: number | null;
+  tpd: number | null;
+}
+
+interface KeyWindowUsage { rpm: number; rpd: number; tpm: number; tpd: number }
+const NO_WINDOW_USAGE: KeyWindowUsage = { rpm: 0, rpd: 0, tpm: 0, tpd: 0 };
+
+interface EligibleKey { id: number; baseUrl: string | null; scope: Set<string> | null }
+
+interface WindowUsageSnapshot {
+  db: unknown;
+  at: number;
+  usage: Map<string, KeyWindowUsage>;
+  keysByPlatform: Map<string, EligibleKey[]>;
+  baseUrlByKeyId: Map<number, string | null>;
+}
+
+/** Utilization moves on the timescale of a rate-limit window, not a request, so
+ *  a few seconds of staleness is invisible to a guardrail while the query count
+ *  drops to ~one per burst. The hard gates above are unaffected — they still
+ *  read live counts, so nothing here can let a request through a real limit. */
+const WINDOW_USAGE_TTL_MS = 5_000;
+
+// The Db handle is part of the cache identity, so reconnecting (tests, a
+// restore) invalidates the snapshot rather than serving another database's
+// numbers.
+let windowUsageSnapshot: WindowUsageSnapshot | null = null;
+
+function usageCacheKey(platform: string, modelId: string, keyId: number): string {
+  return `${platform}\u0000${modelId}\u0000${keyId}`;
+}
+
+function buildWindowUsageSnapshot(now: number): WindowUsageSnapshot | null {
+  return withDb(db => {
+    // One grouped scan replaces four counts per model × key. Same windows the
+    // gates above enforce: a sliding minute for rpm/tpm, a sliding day for
+    // rpd/tpd. Rows older than a day are pruned on write, but the WHERE keeps
+    // this correct even when a prune has not run yet.
+    const rows = db.prepare(`
+      SELECT platform, model_id, key_id,
+             SUM(CASE WHEN kind = 'request' AND created_at_ms > ? THEN 1 ELSE 0 END) AS rpm_used,
+             SUM(CASE WHEN kind = 'request' THEN 1 ELSE 0 END) AS rpd_used,
+             SUM(CASE WHEN kind = 'tokens' AND created_at_ms > ? THEN tokens ELSE 0 END) AS tpm_used,
+             SUM(CASE WHEN kind = 'tokens' THEN tokens ELSE 0 END) AS tpd_used
+        FROM rate_limit_usage
+       WHERE created_at_ms > ?
+       GROUP BY platform, model_id, key_id
+    `).all(now - MINUTE, now - MINUTE, now - DAY) as Array<{
+      platform: string; model_id: string; key_id: number;
+      rpm_used: number; rpd_used: number; tpm_used: number; tpd_used: number;
+    }>;
+
+    const usage = new Map<string, KeyWindowUsage>();
+    for (const r of rows) {
+      usage.set(usageCacheKey(r.platform, r.model_id, r.key_id), {
+        rpm: r.rpm_used, rpd: r.rpd_used, tpm: r.tpm_used, tpd: r.tpd_used,
+      });
+    }
+
+    // Mirror the router's key eligibility (selectKeyForModel): enabled +
+    // healthy/unknown, and the model scope must admit the model. The custom
+    // endpoint check needs base_url for every row, disabled ones included, so
+    // that map is built from the unfiltered read.
+    const keyRows = db.prepare(
+      'SELECT id, platform, base_url, model_scope_json, enabled, status FROM api_keys'
+    ).all() as Array<{
+      id: number; platform: string; base_url: string | null;
+      model_scope_json: string | null; enabled: number; status: string;
+    }>;
+
+    const baseUrlByKeyId = new Map<number, string | null>();
+    const keysByPlatform = new Map<string, EligibleKey[]>();
+    for (const k of keyRows) {
+      baseUrlByKeyId.set(k.id, k.base_url);
+      if (k.enabled !== 1 || (k.status !== 'healthy' && k.status !== 'unknown')) continue;
+      const list = keysByPlatform.get(k.platform) ?? [];
+      list.push({ id: k.id, baseUrl: k.base_url, scope: parseModelScope(k.model_scope_json) });
+      keysByPlatform.set(k.platform, list);
+    }
+
+    return { db, at: now, usage, keysByPlatform, baseUrlByKeyId };
+  }) ?? null;
+}
+
+function getWindowUsageSnapshot(now: number): WindowUsageSnapshot | null {
+  let db;
+  try {
+    db = getDb();
+  } catch {
+    return null;
+  }
+  const cached = windowUsageSnapshot;
+  if (cached && cached.db === db && now - cached.at < WINDOW_USAGE_TTL_MS && now >= cached.at) {
+    return cached;
+  }
+  const built = buildWindowUsageSnapshot(now);
+  windowUsageSnapshot = built;
+  return built;
+}
+
+/** Drop the memoised window snapshot. Tests use it to make a write visible
+ *  immediately; production relies on the TTL. */
+export function invalidateWindowUsage(): void {
+  windowUsageSnapshot = null;
+}
+
+/** The busiest window of one key: the ratio that would reject its next request
+ *  first. A key metered on several windows takes the WORST of them, because the
+ *  binding constraint is what 429s. */
+function keyWindowPressure(usage: KeyWindowUsage, limits: WindowLimits): number {
+  let worst = 0;
+  const ratios: Array<[number, number | null]> = [
+    [usage.rpm, limits.rpm],
+    [usage.rpd, limits.rpd],
+    [usage.tpm, limits.tpm],
+    [usage.tpd, limits.tpd],
+  ];
+  for (const [used, limit] of ratios) {
+    if (limit == null || limit <= 0) continue;
+    const r = used / limit;
+    if (r > worst) worst = r;
+  }
+  return worst;
+}
+
+/**
+ * Share of its binding rate-limit window a model has already consumed, as a
+ * 0..1 fraction (0 idle, 1 exhausted). null = no opinion: the model declares no
+ * window limits, has no routable key to measure, or the database is unreachable.
+ *
+ * Which key's numbers to report matters, and the answer is the same one the
+ * dashboard's usage badge settled on (#921): the guardrail asks "how close is
+ * this model to being unroutable", so it must follow the key the router would
+ * pick NEXT, not the worst key on the account. A platform with one exhausted
+ * key and one idle key routes perfectly well, so we take the ELIGIBLE key with
+ * the MOST headroom.
+ *
+ * In-flight leases are deliberately not counted. They exist to close the
+ * check-then-act race on the hard gates; this is a steering signal averaged over
+ * a whole window, and folding a per-request quantity into a cached snapshot
+ * would buy noise, not accuracy.
+ */
+export function modelWindowUsedFraction(
+  model: { platform: string; modelId: string; keyId?: number | null },
+  limits: WindowLimits,
+  now = Date.now(),
+): number | null {
+  if (limits.rpm == null && limits.rpd == null && limits.tpm == null && limits.tpd == null) return null;
+  const snap = getWindowUsageSnapshot(now);
+  if (!snap) return null;
+
+  const pool = snap.keysByPlatform.get(model.platform);
+  if (!pool || pool.length === 0) return null; // nothing routable → a number would be fiction
+
+  // A custom model belongs to one endpoint; only that endpoint's credentials can
+  // serve it. Legacy rows (key_id NULL) keep the any-key match.
+  const endpointBaseUrl = model.platform === 'custom' && model.keyId != null
+    ? snap.baseUrlByKeyId.get(model.keyId) ?? null
+    : null;
+
+  let best: number | null = null;
+  for (const k of pool) {
+    if (!scopeAllows(k.scope, model.modelId)) continue;
+    if (model.platform === 'custom' && model.keyId != null) {
+      if (endpointBaseUrl == null ? k.id !== model.keyId : k.baseUrl !== endpointBaseUrl) continue;
+    }
+    const usage = snap.usage.get(usageCacheKey(model.platform, model.modelId, k.id)) ?? NO_WINDOW_USAGE;
+    const pressure = keyWindowPressure(usage, limits);
+    if (best === null || pressure < best) best = pressure;
+    if (best === 0) break; // an untouched key is as good as it gets
+  }
+  if (best === null) return null; // every key scoped away from this model
+  return Math.min(1, best);
 }
 
 // ── Provider-wide daily request caps (#162) ──
@@ -572,16 +785,38 @@ export function canUseProviderTokens(
   return used + providerBilledTokens(platform, modelId, estimatedTokens) <= cap;
 }
 
+// ── Degraded-mode memory windows ─────────────────────────────────────────────
+// The in-memory windows are a FALLBACK for the persisted counters: requestCount
+// / tokenCount / providerDailyRequestCount all prefer the DB and only consult
+// memory when the DB refuses to answer. So on a healthy server nothing ever
+// reads these arrays — and pruning happens only on the read path, which means
+// nothing ever trimmed them either: every recorded request leaked one timestamp
+// (and one {ts, tokens} object) for the lifetime of the process.
+//
+// Record in memory only when the persisted write actually failed, and prune the
+// window as we push so a long DB outage cannot grow it past its own width
+// either. Degraded-mode behavior is unchanged: the same timestamps land in the
+// same windows whenever the DB is the one that could not record them.
+function pushMemoryRequest(key: string, windowMs: number, now: number) {
+  const w = getWindow(key);
+  w.timestamps = pruneTimestamps(w.timestamps, windowMs, now);
+  w.timestamps.push(now);
+}
+
+function pushMemoryTokens(key: string, windowMs: number, now: number, tokens: number) {
+  const w = getWindow(key);
+  w.tokenTimestamps = w.tokenTimestamps.filter(t => t.ts > now - windowMs);
+  w.tokenTimestamps.push({ ts: now, tokens });
+}
+
 export function recordRequest(platform: string, modelId: string, keyId: number) {
   const now = Date.now();
 
-  const rpmKey = `${platform}:${modelId}:${keyId}:rpm`;
-  getWindow(rpmKey).timestamps.push(now);
+  if (!recordUsage(platform, modelId, keyId, 'request', 0, now)) {
+    pushMemoryRequest(`${platform}:${modelId}:${keyId}:rpm`, MINUTE, now);
+    pushMemoryRequest(`${platform}:${modelId}:${keyId}:rpd`, DAY, now);
+  }
 
-  const rpdKey = `${platform}:${modelId}:${keyId}:rpd`;
-  getWindow(rpdKey).timestamps.push(now);
-
-  recordUsage(platform, modelId, keyId, 'request', 0, now);
   clearNullLimitHits(platform, modelId, keyId);
   clearCooldownHits(platform, modelId, keyId);
 }
@@ -594,13 +829,10 @@ export function recordTokens(
 ) {
   const now = Date.now();
 
-  const tpmKey = `${platform}:${modelId}:${keyId}:tpm`;
-  getWindow(tpmKey).tokenTimestamps.push({ ts: now, tokens });
-
-  const tpdKey = `${platform}:${modelId}:${keyId}:tpd`;
-  getWindow(tpdKey).tokenTimestamps.push({ ts: now, tokens });
-
-  recordUsage(platform, modelId, keyId, 'tokens', tokens, now);
+  if (!recordUsage(platform, modelId, keyId, 'tokens', tokens, now)) {
+    pushMemoryTokens(`${platform}:${modelId}:${keyId}:tpm`, MINUTE, now, tokens);
+    pushMemoryTokens(`${platform}:${modelId}:${keyId}:tpd`, DAY, now, tokens);
+  }
 }
 
 // Cooldown: when a provider returns 429, block that model+key for a period
@@ -659,6 +891,17 @@ function clearCooldownHits(platform: string, modelId: string, keyId: number): vo
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
 const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 
+// Ceiling for the null-limits escalation path. A provider that publishes no
+// RPD/TPD gives us no counter to check, so "daily-exhausted" there is inferred
+// from repeated 429s alone — and per-minute jitter under load looks exactly the
+// same as a spent daily quota. Letting that guess climb the full ladder means a
+// short burst of RPM 429s can quarantine a model+key for 24h with nothing able
+// to contradict it (a benched route serves no request, so no success arrives to
+// clear the counter). Cap the guess at the ladder's 10-minute step; a genuinely
+// dead route just re-benches every 10 minutes instead of hammering the 90s loop.
+// Real RPD/TPD exhaustion is measured, not guessed, and keeps the full ladder.
+const UNKNOWN_LIMIT_MAX_COOLDOWN_MS = 10 * MINUTE;
+
 // Long cooldown for a 402 Payment Required (provider/key out of credits). Unlike
 // a 429, this won't clear on the next minute/day window — it needs a top-up or
 // billing reset. Bench the model+key for a full day so the router fails over to
@@ -678,8 +921,9 @@ export const MODEL_FORBIDDEN_COOLDOWN_MS = DAY;
 // not yet seeded — common for ollama, cloudflare, nvidia, huggingface, mistral,
 // kilo, llm7, pollinations), we cannot check a counter against a cap. Fall back
 // to a hit-count heuristic: after 2+ 429s within this rolling window, treat as
-// "effectively daily-exhausted" and enter the standard escalation ladder at
-// the same step the documented-RPD path would. Without this, these providers
+// "effectively daily-exhausted" and escalate — but only as far as
+// UNKNOWN_LIMIT_MAX_COOLDOWN_MS, since the verdict is a guess. Without this,
+// these providers
 // stay stuck at TRANSIENT_COOLDOWN_MS forever even when every request is a
 // 429 (observed in production: ollama 130× 429s in 1h with all 90s cooldowns
 // expired before the next request). Cheaper than waiting for the operator to
@@ -841,9 +1085,16 @@ export function getCooldownDecisionForLimit(
     heuristicallyExhausted =
       recentHitCount(platform, modelId, keyId, now) >= NULL_LIMIT_HIT_THRESHOLD;
   }
-  const base = (rpdExhausted || tpdExhausted || heuristicallyExhausted)
-    ? getNextCooldownDuration(platform, modelId, keyId)
-    : TRANSIENT_COOLDOWN_MS;
+  const dailyExhausted = rpdExhausted || tpdExhausted;
+  let base = TRANSIENT_COOLDOWN_MS;
+  if (dailyExhausted || heuristicallyExhausted) {
+    // The ladder step is taken either way, so a route whose real limits get
+    // seeded (or learned) later resumes escalating where it left off rather
+    // than restarting at 2 minutes.
+    base = getNextCooldownDuration(platform, modelId, keyId);
+    // Guessed exhaustion (no published RPD/TPD) never benches past the cap.
+    if (!dailyExhausted) base = Math.min(base, UNKNOWN_LIMIT_MAX_COOLDOWN_MS);
+  }
   // Honor an upstream Retry-After as a floor: never bench shorter than our own
   // heuristic, but extend (capped at a day) when the provider explicitly asks
   // to wait longer than we otherwise would.
@@ -899,6 +1150,29 @@ function clearPersistedCooldown(platform: string, modelId: string, keyId: number
          AND key_id = ?
     `).run(platform, modelId, keyId);
   });
+}
+
+/**
+ * Delete every already-expired cooldown, on disk and in memory, and return how
+ * many rows went. Expiry is otherwise purely lazy: isOnCooldown drops a row only
+ * when something asks about that exact (platform, model, key), so a row whose
+ * model was retired, whose key was deleted, or that simply outlived a process
+ * that had every route benched is never collected — the table only grows, and
+ * every cooldown query (status rollups, the probe scan, penalty inspector) pays
+ * for the dead rows. Called once at boot (index.ts) so a restart starts clean.
+ */
+export function cleanupExpiredCooldowns(now = Date.now()): number {
+  const cleared = withDb(db => {
+    const result = db.prepare('DELETE FROM rate_limit_cooldowns WHERE expires_at_ms <= ?').run(now);
+    return Number(result.changes ?? 0);
+  }) ?? 0;
+
+  // Only the expired entries: this is a sweep, not clearCooldownsForKey — an
+  // active bench must survive it.
+  for (const [key, expiry] of [...cooldowns]) {
+    if (expiry <= now) cooldowns.delete(key);
+  }
+  return cleared;
 }
 
 export function setCooldown(

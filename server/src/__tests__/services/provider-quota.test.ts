@@ -41,6 +41,10 @@ describe('provider-quota: pool inference', () => {
     expect(inferQuotaPoolKey('groq')).toBe('groq::account');
     expect(inferQuotaPoolKey('openrouter', 'meta-llama/llama-3.1-8b-instruct:free')).toBe('openrouter::free');
     expect(inferQuotaPoolKey('openrouter', 'openai/gpt-4o')).toBe('openrouter::account');
+    // AnyAPI's 100K tokens/day is one account-wide budget, so every model on
+    // the platform shares a single pool.
+    expect(inferQuotaPoolKey('anyapi')).toBe('anyapi::free');
+    expect(inferQuotaPoolKey('anyapi', 'qwen/qwen3-coder:free')).toBe('anyapi::free');
     // Unknown platform falls back to platform::model or platform::account.
     expect(inferQuotaPoolKey('acme' as any, 'x')).toBe('acme::x');
     expect(inferQuotaPoolKey('acme' as any)).toBe('acme::account');

@@ -28,6 +28,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { UPDATE_CHECK_CHANGED_EVENT } from '@/components/update-reminder'
 import { Switch } from '@/components/ui/switch'
 import { Tooltip } from '@/components/tooltip'
 import { SUPPORTED_LOCALES, type Locale, useI18n } from '@/i18n'
@@ -659,6 +660,37 @@ function UpdateChecker({ active }: { active: boolean }) {
   const [error, setError] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [activity, setActivity] = useState<string[]>([])
+  // Opt-in for the automatic reminder pill (#782). `null` until the server has
+  // answered, so the row never renders a state that isn't the stored one.
+  const [autoCheck, setAutoCheck] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    if (!active) return
+    let cancelled = false
+    apiFetch<{ enabled: boolean }>('/api/settings/update-check')
+      .then(result => {
+        if (!cancelled) setAutoCheck(result.enabled)
+      })
+      .catch(() => { /* leave the row out rather than claim a state */ })
+    return () => { cancelled = true }
+  }, [active])
+
+  async function toggleAutoCheck(enabled: boolean) {
+    const previous = autoCheck
+    setAutoCheck(enabled)
+    try {
+      const result = await apiFetch<{ enabled: boolean }>('/api/settings/update-check', {
+        method: 'PUT',
+        body: JSON.stringify({ enabled }),
+      })
+      setAutoCheck(result.enabled)
+      // The reminder is mounted outside this dialog; tell it to re-check now
+      // instead of leaving a stale pill (or no pill) until the next reload.
+      window.dispatchEvent(new Event(UPDATE_CHECK_CHANGED_EVENT))
+    } catch {
+      setAutoCheck(previous)
+    }
+  }
 
   useEffect(() => {
     if (!active) return
@@ -793,6 +825,20 @@ function UpdateChecker({ active }: { active: boolean }) {
           </div>
         )}
       />
+
+      {autoCheck !== null && (
+        <Row
+          label={t('settings.autoUpdateCheck')}
+          hint={t('settings.autoUpdateCheckHelp')}
+          control={(
+            <Switch
+              aria-label={t('settings.autoUpdateCheck')}
+              checked={autoCheck}
+              onCheckedChange={checked => void toggleAutoCheck(checked)}
+            />
+          )}
+        />
+      )}
 
       <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
         <DialogPopup maxWidth="max-w-xl" className="p-0">

@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { apiFetch } from '@/lib/api'
-import { ChevronDown, Plus } from 'lucide-react'
+import { ChevronDown, KeyRound, Plus, Unlock } from 'lucide-react'
+import { Tooltip } from '@/components/tooltip'
 import { useI18n } from '@/i18n'
 
 // Shape of GET /api/keys/providers (#543). Declared inline: the backend owns
@@ -61,20 +62,38 @@ export function ProviderChecklistSection({ onAddKey }: { onAddKey: (platform: st
       {expanded && (
         <div className="mt-2 flex flex-wrap gap-1.5">
           {unconfigured.map(p => (
-            <button
+            // The status reads as an icon, not a word: the chip row is dense and
+            // the labels repeated on every chip. The wrapper is the shared
+            // Tooltip, which opens on hover and — because focus bubbles up from
+            // the button inside it — on keyboard focus too, so the sentence the
+            // icon replaces is still one hover or one Tab away. The short label
+            // stays as sr-only text, keeping the button's accessible name.
+            <Tooltip
               key={p.platform}
-              type="button"
-              onClick={() => onAddKey(p.platform)}
-              className="inline-flex h-5 items-center gap-1 rounded-4xl border border-border px-2 text-xs font-medium whitespace-nowrap transition-all hover:bg-muted focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              text={p.keyless ? t('keys.checklistKeylessTip') : t('keys.checklistNoKeyTip')}
             >
-              <Plus className="size-3 text-muted-foreground" />
-              {p.name}
-              {p.keyless && (
-                <span className="text-[10px] font-normal text-muted-foreground">
-                  {t('keys.checklistKeyless')}
-                </span>
-              )}
-            </button>
+              <button
+                type="button"
+                onClick={() => onAddKey(p.platform)}
+                className="inline-flex h-5 items-center gap-1 rounded-4xl border border-border px-2 text-xs font-medium whitespace-nowrap transition-all hover:bg-muted focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50"
+              >
+                <Plus className="size-3 text-muted-foreground" />
+                {p.name}
+                {p.keyless ? (
+                  <span className="inline-flex text-muted-foreground">
+                    <Unlock className="size-3.5" aria-hidden="true" />
+                    <span className="sr-only">{t('keys.checklistKeyless')}</span>
+                  </span>
+                ) : (
+                  // Needs a key but none added yet — the actionable case. Amber
+                  // so the "add this" providers stand out from anonymous ones.
+                  <span className="inline-flex text-amber-600 dark:text-amber-400">
+                    <KeyRound className="size-3.5" aria-hidden="true" />
+                    <span className="sr-only">{t('models.noKey')}</span>
+                  </span>
+                )}
+              </button>
+            </Tooltip>
           ))}
         </div>
       )}

@@ -58,7 +58,8 @@ describe('CSP allows the inline theme bootstrap (#682)', () => {
   });
 
   it('serves that hash in the script-src directive', async () => {
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/api/ping`);
     server.close();
@@ -67,7 +68,8 @@ describe('CSP allows the inline theme bootstrap (#682)', () => {
   });
 
   it('still refuses inline scripts generally — no unsafe-inline for scripts', async () => {
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/api/ping`);
     server.close();

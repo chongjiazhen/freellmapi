@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getDb } from '../db/index.js';
 import { checkKeyHealth, checkAllKeys } from '../services/health.js';
+import { getDegradationStatus } from '../services/degradation.js';
 import { hasProvider } from '../providers/index.js';
 import { getQuotaStateForKeys } from '../services/provider-quota.js';
 
@@ -54,6 +55,7 @@ healthRouter.get('/', (_req: Request, res: Response) => {
       lastHealthError: k.last_health_error,
     })),
     quotaStates: getQuotaStateForKeys(),
+    degradation: getDegradationStatus(),
   });
 });
 

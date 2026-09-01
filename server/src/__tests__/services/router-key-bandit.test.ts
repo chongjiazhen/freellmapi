@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { routeRequest, refreshStatsCache, setRoutingStrategy } from '../../services/router.js';
 import * as ratelimit from '../../services/ratelimit.js';
 import { getDb, initDb } from '../../db/index.js';
+import { addToActiveChain } from '../helpers/chain.js';
 
 // Per-key scoring inside one model (#580): with the group merge, several keys
 // (and formerly several providers' identically-named models) share one routing
@@ -39,6 +40,7 @@ function addModel(opts: {
   const id = (db.prepare('SELECT id FROM models WHERE platform = ? AND model_id = ?')
     .get(opts.platform, opts.modelId) as { id: number }).id;
   db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(id, opts.priority ?? 1);
+  addToActiveChain(id, opts.priority ?? 1);
   return id;
 }
 
@@ -116,7 +118,10 @@ describe('per-key bandit selection', () => {
     addKeyHistory('groq', 'm', seasoned, { successes: 40, failures: 2 });
     refreshStatsCache(getDb(), true);
 
-    const counts = pickKeyCounts(300);
+    // Thompson sampling gives an unmeasured key a small but non-zero chance of
+    // winning each draw (~1.5% with this prior), so 300 draws flaked in CI when
+    // the fresh key lost every one. 3000 draws make that ~1e-20 instead.
+    const counts = pickKeyCounts(3000);
     expect(counts[fresh] ?? 0).toBeGreaterThan(0);
     expect(counts[seasoned] ?? 0).toBeGreaterThan(0);
   });

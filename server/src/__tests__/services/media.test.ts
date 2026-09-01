@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { runImageGeneration, runSpeech, MediaError } from '../../services/media.js';
+import { runImageGeneration, runVideoGeneration, runSpeech, MediaError } from '../../services/media.js';
 
 const realFetch = globalThis.fetch;
 
@@ -25,7 +25,7 @@ function addCustomKey(baseUrl: string, raw = 'custom-media-key'): number {
 function addMedia(
   platform: string,
   modelId: string,
-  modality: 'image' | 'audio',
+  modality: 'image' | 'video' | 'audio',
   priority = 1,
   keyId: number | null = null,
   metaJson: string | null = null,
@@ -68,6 +68,46 @@ describe('media service', () => {
       expect(r.images[0].b64_json).toBe('AAAA');
     });
 
+    it('NVIDIA FLUX.1 Dev: sends the validated 28-step 1024x1024 payload', async () => {
+      addMedia('nvidia', 'black-forest-labs/flux.1-dev', 'image');
+      addKey('nvidia');
+      const fetchMock = vi.fn(async () => jsonResponse({ artifacts: [{ base64: 'DEV' }] }));
+      globalThis.fetch = fetchMock as any;
+
+      await runImageGeneration('black-forest-labs/flux.1-dev', {
+        prompt: 'a lighthouse',
+        size: '512x512',
+      });
+
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body).toEqual({
+        prompt: 'a lighthouse',
+        mode: 'base',
+        steps: 28,
+        width: 1024,
+        height: 1024,
+        cfg_scale: 3.5,
+      });
+    });
+
+    it('NVIDIA FLUX.2 Klein 4B: omits unsupported mode and guidance fields', async () => {
+      addMedia('nvidia', 'black-forest-labs/flux.2-klein-4b', 'image');
+      addKey('nvidia');
+      const fetchMock = vi.fn(async () => jsonResponse({ artifacts: [{ base64: 'KLEIN' }] }));
+      globalThis.fetch = fetchMock as any;
+
+      await runImageGeneration('black-forest-labs/flux.2-klein-4b', {
+        prompt: 'a red kite',
+        size: '512x512',
+      });
+
+      const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body));
+      expect(body).toEqual({ prompt: 'a red kite', steps: 4, width: 1024, height: 1024 });
+      expect(body).not.toHaveProperty('mode');
+      expect(body).not.toHaveProperty('guidance');
+      expect(body).not.toHaveProperty('cfg_scale');
+    });
+
     it('Pollinations: keyless GET, raw bytes → b64_json (no api key needed)', async () => {
       addMedia('pollinations', 'flux', 'image');
       globalThis.fetch = vi.fn(async () =>
@@ -77,17 +117,16 @@ describe('media service', () => {
       expect(r.images[0].b64_json).toBe(Buffer.from('PNGDATA').toString('base64'));
     });
 
-    it('Cloudflare: JSON {result.image} → b64_json', async () => {
+    it('Cloudflare FLUX.1 Schnell: sends only the prompt and maps result.image', async () => {
       addMedia('cloudflare', '@cf/black-forest-labs/flux-1-schnell', 'image');
       addKey('cloudflare', 'acct123:token456');
       const fetchMock = vi.fn(async () => jsonResponse({ result: { image: 'CFB64' }, success: true }));
       globalThis.fetch = fetchMock as any;
       const r = await runImageGeneration('@cf/black-forest-labs/flux-1-schnell', { prompt: 'x' });
       expect(r.images[0].b64_json).toBe('CFB64');
-      // A row without meta keeps the JSON body every other CF image model takes.
       const init = fetchMock.mock.calls[0][1] as RequestInit;
       expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
-      expect(JSON.parse(String(init.body))).toMatchObject({ prompt: 'x' });
+      expect(JSON.parse(String(init.body))).toEqual({ prompt: 'x' });
     });
 
     it('Cloudflare: requestStyle multipart sends form-data (FLUX.2 rejects JSON)', async () => {
@@ -179,6 +218,189 @@ describe('media service', () => {
       expect(body).toMatchObject({ model: 'local-image', prompt: 'a cat', n: 2, size: '512x512' });
       const log = getDb().prepare("SELECT key_id FROM requests WHERE request_type = 'image' ORDER BY id DESC LIMIT 1").get() as { key_id: number };
       expect(log.key_id).toBe(keyId);
+    });
+  });
+
+  describe('video generation', () => {
+    it('Pollinations: sends the authenticated nova-reel request and returns MP4 bytes', async () => {
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      const fetchMock = vi.fn(async () =>
+        new Response(Buffer.from('MP4DATA'), { status: 200, headers: { 'content-type': 'video/mp4' } }));
+      globalThis.fetch = fetchMock as any;
+
+      const result = await runVideoGeneration('nova-reel', {
+        prompt: 'sunrise over a lake',
+        duration: 12,
+        aspectRatio: '16:9',
+        seed: 7,
+      });
+
+      expect(result.platform).toBe('pollinations');
+      expect(result.video.toString()).toBe('MP4DATA');
+      expect(result.contentType).toBe('video/mp4');
+      const url = new URL(String(fetchMock.mock.calls[0][0]));
+      expect(url.pathname).toBe('/video/sunrise%20over%20a%20lake');
+      expect(url.searchParams.get('model')).toBe('nova-reel');
+      expect(url.searchParams.get('duration')).toBe('12');
+      expect(url.searchParams.get('aspectRatio')).toBe('16:9');
+      expect((fetchMock.mock.calls[0][1] as RequestInit).headers).toMatchObject({
+        Authorization: 'Bearer sk_pollinations_test',
+      });
+    });
+
+    it('Pollinations: omits duration entirely when the caller did not ask for one', async () => {
+      // Allowed lengths differ per model (nova-reel 6-120 by 6, veo 4/6/8,
+      // minimax-h3 exactly 5), so guessing one would 400 on most of the
+      // roster. No duration means the provider uses the model's own default.
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      const fetchMock = vi.fn(async () =>
+        new Response(Buffer.from('MP4DATA'), { status: 200, headers: { 'content-type': 'video/mp4' } }));
+      globalThis.fetch = fetchMock as any;
+
+      await runVideoGeneration('nova-reel', { prompt: 'sunrise over a lake' });
+
+      const url = new URL(String(fetchMock.mock.calls[0][0]));
+      expect(url.searchParams.has('duration')).toBe(false);
+      expect(url.searchParams.get('model')).toBe('nova-reel');
+    });
+
+    it('Pollinations: rejects unsupported nova-reel durations before calling upstream', async () => {
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations');
+      const fetchMock = vi.fn();
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('nova-reel', {
+        prompt: 'x',
+        duration: 7,
+      })).rejects.toMatchObject({ status: 400 });
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('Hugging Face: submits and resolves the fal.ai queue without leaking the token to the media URL', async () => {
+      addMedia(
+        'huggingface',
+        'Lightricks/LTX-Video-0.9.5',
+        'video',
+        1,
+        null,
+        JSON.stringify({ providerModelId: 'fal-ai/ltx-video-v095' }),
+      );
+      addKey('huggingface', 'hf_test_token');
+      // The submit is answered with a job that is still queued, so the poll
+      // loop actually runs: an unmatched URL is a hard failure rather than
+      // falling through to a canned COMPLETED reply.
+      const submitUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095?_subdomain=queue';
+      const jobUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095/requests/job-1?_subdomain=queue';
+      const statusUrl = 'https://router.huggingface.co/fal-ai/fal-ai/ltx-video-v095/requests/job-1/status?_subdomain=queue';
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === submitUrl) {
+          return jsonResponse({
+            request_id: 'job-1',
+            status: 'IN_QUEUE',
+            response_url: 'https://queue.fal.run/fal-ai/ltx-video-v095/requests/job-1',
+          });
+        }
+        if (url === statusUrl) return jsonResponse({ status: 'COMPLETED' });
+        if (url === jobUrl) {
+          return jsonResponse({ video: { url: 'https://cdn.example.test/video.mp4', content_type: 'video/mp4' } });
+        }
+        if (url === 'https://cdn.example.test/video.mp4') {
+          return new Response(Buffer.from('HFVIDEO'), { status: 200, headers: { 'content-type': 'video/mp4' } });
+        }
+        throw new Error(`unexpected fetch: ${url}`);
+      });
+      globalThis.fetch = fetchMock as any;
+
+      const result = await runVideoGeneration('Lightricks/LTX-Video-0.9.5', {
+        prompt: 'paper boats on a stream',
+        seed: 42,
+      });
+
+      expect(result.video.toString()).toBe('HFVIDEO');
+      expect(fetchMock.mock.calls.map(c => String(c[0]))).toEqual([
+        submitUrl,
+        statusUrl,
+        jobUrl,
+        'https://cdn.example.test/video.mp4',
+      ]);
+      expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body))).toEqual({
+        prompt: 'paper boats on a stream',
+        seed: 42,
+      });
+      // The status and result reads are authenticated; the CDN download is not,
+      // so the HF token never reaches a host named by an upstream response.
+      expect((fetchMock.mock.calls[1][1] as RequestInit).headers).toMatchObject({
+        Authorization: 'Bearer hf_test_token',
+      });
+      expect((fetchMock.mock.calls[3][1] as RequestInit).headers).toBeUndefined();
+    });
+
+    it('stops the chain when the API caller hangs up instead of paying for a second provider', async () => {
+      addMedia('pollinations', 'nova-reel', 'video', 1);
+      addMedia('pollinations', 'wan-fast', 'video', 2);
+      addKey('pollinations', 'sk_pollinations_test');
+      const controller = new AbortController();
+      const fetchMock = vi.fn(async () => {
+        controller.abort();
+        throw new Error('socket hang up');
+      });
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('auto', { prompt: 'x' }, controller.signal))
+        .rejects.toMatchObject({ status: 499 });
+      // The second catalogued provider is never attempted.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports an upstream key rejection as an upstream failure, not a caller auth error', async () => {
+      // A 401 from the provider means the OPERATOR's key was refused. Passing
+      // it to the caller would tell an OpenAI SDK that its own gateway key is
+      // bad; a caller-attributable 400 does travel through.
+      addMedia('pollinations', 'nova-reel', 'video');
+      addKey('pollinations', 'sk_pollinations_test');
+      globalThis.fetch = vi.fn(async () => new Response('nope', { status: 401 })) as any;
+      await expect(runVideoGeneration('nova-reel', { prompt: 'x' }))
+        .rejects.toMatchObject({ status: 502 });
+
+      globalThis.fetch = vi.fn(async () => new Response('bad prompt', { status: 400 })) as any;
+      await expect(runVideoGeneration('nova-reel', { prompt: 'x' }))
+        .rejects.toMatchObject({ status: 400 });
+    });
+
+    it('Hugging Face: refuses a result URL that points at a blocked address class', async () => {
+      // The result URL is the one URL in this adapter that comes out of an
+      // upstream JSON body, so it goes through the same guard custom-provider
+      // base URLs do (#440) instead of being fetched and streamed back.
+      addMedia(
+        'huggingface',
+        'Lightricks/LTX-Video-0.9.5',
+        'video',
+        1,
+        null,
+        JSON.stringify({ providerModelId: 'fal-ai/ltx-video-v095' }),
+      );
+      addKey('huggingface', 'hf_test_token');
+      const fetchMock = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.includes('requests/job-1?_subdomain=queue')) {
+          return jsonResponse({ video: { url: 'http://169.254.169.254/latest/meta-data/' } });
+        }
+        return jsonResponse({
+          request_id: 'job-1',
+          status: 'COMPLETED',
+          response_url: 'https://queue.fal.run/fal-ai/ltx-video-v095/requests/job-1',
+        });
+      });
+      globalThis.fetch = fetchMock as any;
+
+      await expect(runVideoGeneration('Lightricks/LTX-Video-0.9.5', { prompt: 'x' }))
+        .rejects.toThrow(/unusable video URL/);
+      // Submit + result read only; the metadata address was never contacted.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
 

@@ -1,5 +1,9 @@
 // ---- Platform & Model Types ----
 
+/** How the global outbound proxy URL is interpreted. Per-key proxies always
+ * use the traditional forward-proxy transport. */
+export type ProxyMode = 'forward' | 'fetch-relay';
+
 /** A model declared beside a custom endpoint in an import file (#382). A
  *  capability flag is present only when the paste declared it via a trailing
  *  -TOOLS / -VISION suffix. */
@@ -60,6 +64,14 @@ export type Platform =
   | 'google'
   | 'groq'
   | 'cerebras'
+  // B.AI — OpenAI-compatible gateway. Its catalog row is a live-tested,
+  // limited-time 0-credit promotion, not a recurring free allowance.
+  | 'bai'
+  // AnyAPI — OpenAI-compatible gateway. Free tier is $0/no card/recurring but
+  // capped at 100K tokens/day over "free and basic" models only; no RPM/RPD is
+  // published. Catalog rows live in the hosted catalog (premium now, free after
+  // 30 days).
+  | 'anyapi'
   | 'nvidia'
   | 'mistral'
   | 'sambanova'
@@ -119,6 +131,27 @@ export type Platform =
   // (Google sign-in, no card, no region wall) at 10 RPM; catalog rows live in
   // the Oracle catalog (premium now, free after 30 days).
   | 'sealion'
+  // OrcaRouter — OpenAI-compatible aggregator (api.orcarouter.ai/v1). Free key
+  // from orcarouter.ai (no card); recurring rate-limited free aliases at $0
+  // (never fall back to paid). Catalog rows live in the Oracle catalog
+  // (premium now, free after the 30-day model-age gate).
+  | 'orcarouter'
+  // UnoRouter (unorouter.com) — OpenAI-compatible aggregator. The web app is a
+  // Next.js site at unorouter.com; the API lives at api.unorouter.com/v1. Free
+  // key from unorouter.com (no card); free models carry a `:free` suffix and a
+  // per-minute rate limit (429 on cap, e.g. "1 request(s) every 1 min").
+  // Live-probed 2026-08-23: /v1/models is public without a key but 401s on a
+  // wrong key, and /v1/chat/completions 401s without a key, so default key
+  // validation works. Catalog rows live in the hosted catalog (premium now,
+  // free after the 30-day model-age gate).
+  | 'unorouter'
+  // xKiro (xkiro.com) — OpenAI-compatible gateway at api.xkiro.com/v1. Free key
+  // from xkiro.com (no card); free plan is 5M tokens/day on its free models,
+  // paid models 403 on a free key.
+  // /v1/models is public (200 with no key), so key validation must probe
+  // /v1/usage, which 401s on a missing/invalid ClientApiKey. Catalog rows live
+  // in the hosted catalog (premium now, free after the 30-day model-age gate).
+  | 'xkiro'
   // ModelScope (魔搭社区, Alibaba) — OpenAI-compatible inference API
   // (api-inference.modelscope.cn/v1). Free tier is 2000 requests/day
   // account-wide, but calls only work after the ModelScope account is bound to
@@ -126,6 +159,38 @@ export type Platform =
   // verification — tokens mint without binding, then every call 401s. Catalog
   // rows land after community testing confirms per-model behavior (#581).
   | 'modelscope'
+  // ── Chinese domestic providers (#922/#923/#924) ────────────────────────────
+  // All four need Chinese real-name verification (实名认证) on the cloud account
+  // before a key will serve traffic, the same wall ModelScope hits above.
+  // LongCat is the exception worth knowing: its platform accepts an email
+  // signup from outside mainland China.
+  //
+  // Baidu Qianfan (百度千帆) — OpenAI-compatible (https://qianfan.baidubce.com/v2).
+  // The ERNIE-Speed / ERNIE-Lite / ERNIE-Tiny series are free indefinitely via
+  // pay-as-you-go billing rather than a token pool, so the ceiling is rate
+  // limits, not a balance. Baidu calls the arrangement "long-term". Real-name
+  // auth (individual or enterprise) required.
+  | 'qianfan'
+  // Volcengine Ark (火山方舟, ByteDance) — OpenAI-compatible
+  // (https://ark.cn-beijing.volces.com/api/v3). Individual developers get a
+  // RECURRING daily per-model free reward quota (raised from 500K to 2M
+  // tokens/day/model), on top of a one-time 500K new-user grant. The strongest
+  // recurring free tier of the four.
+  | 'volcengine'
+  // LongCat (Meituan / 美团) — OpenAI-compatible
+  // (https://api.longcat.chat/openai/v1); also exposes an Anthropic-compatible
+  // surface at /anthropic. Free tier is daily; the figure quoted at platform
+  // launch was 100K tokens/day. Meituan has ANNOUNCED a 50M tokens/day
+  // Flash-Lite free tier but it was described as a future plan, so it is not
+  // treated as live here.
+  | 'longcat'
+  // iFlytek Spark (讯飞星火) — OpenAI-compatible
+  // (https://spark-api-open.xf-yun.com/v1), Bearer auth using the console's
+  // APIPassword (not the APIKey/APISecret pair the older WebSocket API used).
+  // The Lite model (model id `lite`) is documented as free to call; iFlytek
+  // does not publish a token ceiling or a QPS figure for it, so neither is
+  // claimed here.
+  | 'xfyun'
   // AI Horde — free, community-powered inference (volunteer workers) via an
   // OpenAI-compatible proxy (https://oai.aihorde.net/v1). Queue-based, so calls
   // can take tens of seconds; no tool support; usage is reported as kudos, not
@@ -188,7 +253,7 @@ export type KeyStatus = 'healthy' | 'rate_limited' | 'invalid' | 'error' | 'unkn
 
 export interface ApiKeyModel {
   id: number;
-  kind: 'chat' | 'embedding' | 'image' | 'audio';
+  kind: 'chat' | 'embedding' | 'image' | 'audio' | 'transcription';
   modelId: string;
   displayName: string;
   family?: string | null;
@@ -334,6 +399,9 @@ export interface ChatCompletionRequest {
   temperature?: number;
   max_tokens?: number;
   stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
   top_p?: number;
   stop?: string | string[];
   tools?: ChatToolDefinition[];
@@ -354,6 +422,11 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // OpenAI-standard breakdown some providers advertise alongside the totals.
+  // Optional because many free-tier endpoints omit it; the proxy falls back
+  // to its chars/4 estimate when absent. (#764)
+  completion_tokens_details?: { reasoning_tokens?: number };
+  prompt_tokens_details?: { cached_tokens?: number };
 }
 
 export interface ChatCompletionResponse {
@@ -384,6 +457,7 @@ export interface ChatCompletionChunk {
     };
     finish_reason: string | null;
   }[];
+  usage?: TokenUsage;
 }
 
 // ---- Analytics Types ----

@@ -38,6 +38,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tooltip as HoverTooltip } from '@/components/tooltip'
 import { formatSqliteUtcToLocalTime } from '@/lib/utils'
 import { platformColors } from '@/lib/routing'
+import { categoryAxisProps, verticalCategoryAxisProps } from '@/lib/chart-axis'
 import { useI18n } from '@/i18n'
 
 type TimeRange = '24h' | '7d' | '30d' | '90d'
@@ -77,6 +78,13 @@ interface SummaryResponse {
 
 interface ByPlatformRow {
   platform: string
+  // Stable identity for the filter dropdown. For a catalog platform it equals
+  // `platform`; for a custom endpoint it is `custom:<base_url>` (#889), so each
+  // relay is filterable on its own instead of collapsing into 'custom'.
+  providerId: string
+  // Human display name. Catalog: the platform id. Custom: the endpoint host
+  // (e.g. 'relay.example.com') so several relays are distinguishable.
+  endpoint?: string
   requests: number
   successRate: number
   avgLatencyMs: number
@@ -109,6 +117,11 @@ interface TimelineBucket {
 
 interface ByModelRow {
   platform: string
+  // Endpoint identity of the row (#889). The same model id served by two
+  // custom relays is two rows, one per relay, so the name has to say which.
+  // Same id/name pair /by-platform returns for that endpoint.
+  providerId?: string
+  endpoint?: string
   modelId: string
   displayName: string
   requests: number
@@ -133,13 +146,19 @@ interface ByKeyRow {
 
 interface ErrorDistribution {
   byCategory: Array<{ category: string; count: number }>
-  byPlatform: Array<{ platform: string; count: number }>
+  // One entry per provider — per custom ENDPOINT, not one pooled 'custom'
+  // entry (#889); `platform` is kept for the dot coloring.
+  byPlatform: Array<{ platform: string; providerId?: string; endpoint?: string; count: number }>
   detailed: Array<{ platform: string; model_id: string; error_category: string; count: number }>
 }
 
 interface RecentErrorRow {
   id: number
   platform: string
+  // Which endpoint produced the error: the platform slug for catalog
+  // providers, the custom endpoint's host/path for a relay (#889).
+  providerId?: string
+  endpoint?: string
   modelId: string
   error: string
   latencyMs: number
@@ -160,6 +179,10 @@ interface RecentCallRow {
   clientIp: string | null
   clientUserAgent: string | null
   createdAt: string
+  // #785: custom endpoints all share the generic 'custom' platform id; the
+  // user's key label ("Ollama box") names the real provider. Null when the
+  // key was deleted or never labelled.
+  keyLabel: string | null
   // Failover-ladder length: attempts hang off the TERMINAL row of a proxied
   // request, so mid-ladder failure rows report 0.
   attemptCount: number
@@ -176,6 +199,10 @@ interface RequestAttempt {
   platform: string
   modelId: string
   keyOrdinal: number
+  // Operator-facing key label captured at attempt time (#869); null when the
+  // key had no label. Shown in a tooltip on the key badge so a multi-key
+  // provider's ladder says WHICH key was tried, not just key1/key2.
+  keyLabel: string | null
   outcome: string
   startOffsetMs: number
   durationMs: number
@@ -369,7 +396,9 @@ function RequestDetailDialog({ requestId, onClose }: { requestId: number | null;
                         <PlatformDot platform={a.platform} />
                         <span className="font-medium">{a.platform}</span>
                         <span className="text-muted-foreground truncate" title={a.modelId}>{a.modelId}</span>
-                        <Badge variant="outline">{t('analytics.keyOrdinal', { n: a.keyOrdinal })}</Badge>
+                        <HoverTooltip text={a.keyLabel ? `${t('analytics.keyBadge', { n: a.keyOrdinal })} · ${a.keyLabel}` : t('analytics.keyBadge', { n: a.keyOrdinal })}>
+                          <Badge variant="outline">{t('analytics.keyOrdinal', { n: a.keyOrdinal })}</Badge>
+                        </HoverTooltip>
                         {/* client_abort is the caller's doing, not a hop failure. */}
                         <Badge variant={a.outcome === 'ok' || a.outcome === 'committed' ? 'secondary' : a.outcome === 'client_abort' ? 'outline' : 'destructive'}>
                           {a.outcome}
@@ -400,6 +429,22 @@ const axisStyle = { fontSize: 11, fill: 'var(--muted-foreground)' } as const
 const gridStyle = 'var(--border)'
 const primaryFill = 'var(--foreground)'
 const tooltipStyle = { backgroundColor: 'var(--popover)', border: '1px solid var(--border)', borderRadius: 8, fontSize: 12 } as const
+
+// The timeline endpoint buckets on the viewer's wall clock (the query sends
+// the browser's tzOffset), so its zone-less timestamps ("2026-08-10T14:00:00"
+// hourly, "2026-08-10" daily) are already local time. Parse them as local —
+// re-interpreting them as UTC here would shift every tick a second time.
+function formatTimelineTick(value: string): string {
+  if (!value) return ''
+  const iso = value.includes('T') ? value : `${value}T00:00:00`
+  const date = new Date(iso)
+  if (isNaN(date.getTime())) return value
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    ...(value.includes('T') ? { hour: '2-digit', minute: '2-digit' } : {}),
+  })
+}
 
 // Two categorical series hues, validated against the app's actual chart
 // surfaces (light card #ffffff, dark card #101010) with the dataviz palette
@@ -435,14 +480,23 @@ export default function AnalyticsPage() {
     queryFn: () => apiFetch<ByPlatformRow[]>(`/api/analytics/by-platform?range=${range}`),
   })
 
+  // Friendly display name per providerId: catalog → the platform id, custom →
+  // the endpoint host. Used by the filter dropdown so a selected custom relay
+  // shows 'relay.example.com', not 'custom:https://relay.example.com' (#889).
+  const providerDisplay = new Map(byPlatform.map((p) => [p.providerId, p.endpoint ?? p.platform]))
+
   const { data: byClient = [] } = useQuery({
     queryKey: ['analytics', 'by-client', range],
     queryFn: () => apiFetch<ByClientRow[]>(`/api/analytics/by-client?range=${range}`),
   })
 
+  // Browser's offset from UTC in minutes (480 = UTC+8), so the server buckets
+  // timeline hours/days on the viewer's wall clock instead of UTC.
+  const tzOffset = -new Date().getTimezoneOffset()
+
   const { data: timeline = [] } = useQuery({
-    queryKey: ['analytics', 'timeline', range],
-    queryFn: () => apiFetch<TimelineBucket[]>(`/api/analytics/timeline?range=${range}`),
+    queryKey: ['analytics', 'timeline', range, tzOffset],
+    queryFn: () => apiFetch<TimelineBucket[]>(`/api/analytics/timeline?range=${range}&tzOffset=${tzOffset}`),
   })
 
   const { data: byModel = [] } = useQuery({
@@ -477,7 +531,9 @@ export default function AnalyticsPage() {
     queryFn: () => {
       const params = new URLSearchParams({ range, limit: '100' })
       if (statusFilter !== 'all') params.set('status', statusFilter)
-      if (platformFilter !== 'all') params.set('platform', platformFilter)
+      // provider (not platform) so a selected custom relay filters to itself
+      // instead of every custom endpoint (#889). Catalog ids equal the platform.
+      if (platformFilter !== 'all') params.set('provider', platformFilter)
       return apiFetch<RecentCallsResponse>(`/api/analytics/requests?${params}`)
     },
   })
@@ -591,7 +647,7 @@ export default function AnalyticsPage() {
                 <ResponsiveContainer width="100%" height={240}>
                   <LineChart data={timeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} tickFormatter={formatTimelineTick} />
                     <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                     <Tooltip contentStyle={tooltipStyle} />
                     <Legend wrapperStyle={{ fontSize: 12 }} iconType="line" />
@@ -612,7 +668,7 @@ export default function AnalyticsPage() {
                 <ResponsiveContainer width="100%" height={240}>
                   <LineChart data={timeline} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                    <XAxis dataKey="timestamp" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} tickFormatter={formatTimelineTick} />
                     <YAxis tick={axisStyle} tickLine={false} axisLine={false} tickFormatter={(v: number) => formatTokens(v)} />
                     <Tooltip contentStyle={tooltipStyle} formatter={(value) => formatTokens(Number(value))} />
                     <Legend wrapperStyle={{ fontSize: 12 }} iconType="line" />
@@ -631,7 +687,7 @@ export default function AnalyticsPage() {
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                  <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <XAxis dataKey={(row: ByPlatformRow) => row.endpoint ?? row.platform} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} {...categoryAxisProps(byPlatform.length)} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Bar dataKey="requests" name={t('analytics.requests')} fill={primaryFill} radius={[3, 3, 0, 0]} maxBarSize={24} />
@@ -647,7 +703,7 @@ export default function AnalyticsPage() {
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byClient} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                  <XAxis dataKey="clientAgent" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <XAxis dataKey="clientAgent" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} {...categoryAxisProps(byClient.length)} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Bar dataKey="requests" name={t('analytics.requests')} fill={seriesB} radius={[3, 3, 0, 0]} maxBarSize={24} />
@@ -664,7 +720,7 @@ export default function AnalyticsPage() {
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                  <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <XAxis dataKey={(row: ByPlatformRow) => row.endpoint ?? row.platform} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} {...categoryAxisProps(byPlatform.length)} />
                   <YAxis unit="ms" tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Legend wrapperStyle={{ fontSize: 12 }} iconType="rect" />
@@ -685,7 +741,7 @@ export default function AnalyticsPage() {
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                  <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <XAxis dataKey={(row: ByPlatformRow) => row.endpoint ?? row.platform} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} {...categoryAxisProps(byPlatform.length)} />
                   <YAxis unit="ms" tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Bar dataKey="avgTtfbMs" name={t('analytics.avgTtft')} fill={seriesA} radius={[3, 3, 0, 0]} maxBarSize={24} />
@@ -703,7 +759,7 @@ export default function AnalyticsPage() {
                 <BarChart data={errorDist.byCategory} layout="vertical" margin={{ top: 6, right: 12, left: 8, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} horizontal={false} />
                   <XAxis type="number" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} allowDecimals={false} />
-                  <YAxis type="category" dataKey="category" tick={axisStyle} tickLine={false} axisLine={false} width={128} />
+                  <YAxis type="category" dataKey="category" tick={axisStyle} tickLine={false} axisLine={false} {...verticalCategoryAxisProps()} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Bar dataKey="count" name={t('analytics.errors')} fill="var(--destructive)" radius={[0, 3, 3, 0]} maxBarSize={24} />
                 </BarChart>
@@ -718,7 +774,7 @@ export default function AnalyticsPage() {
               <ResponsiveContainer width="100%" height={240}>
                 <BarChart data={errorDist.byPlatform} margin={{ top: 6, right: 6, left: -12, bottom: 0 }}>
                   <CartesianGrid strokeDasharray="2 4" stroke={gridStyle} />
-                  <XAxis dataKey="platform" tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} />
+                  <XAxis dataKey={(row: ErrorDistribution['byPlatform'][number]) => row.endpoint ?? row.platform} tick={axisStyle} tickLine={false} axisLine={{ stroke: gridStyle }} {...categoryAxisProps(errorDist.byPlatform.length)} />
                   <YAxis tick={axisStyle} tickLine={false} axisLine={false} />
                   <Tooltip contentStyle={tooltipStyle} />
                   <Bar dataKey="count" name={t('analytics.errors')} fill="var(--destructive)" radius={[3, 3, 0, 0]} maxBarSize={24} />
@@ -743,7 +799,7 @@ export default function AnalyticsPage() {
                   <TableBody>
                     {errors.slice(0, 20).map((e) => (
                       <TableRow key={e.id}>
-                        <TableCell className="pl-4 text-xs">{e.platform}</TableCell>
+                        <TableCell className="pl-4 text-xs">{e.endpoint ?? e.platform}</TableCell>
                         <TableCell className="text-xs max-w-[200px] truncate">{e.error}</TableCell>
                         <TableCell className="text-right text-xs text-muted-foreground tabular-nums pr-4">
                           {formatSqliteUtcToLocalTime(e.createdAt, { hour: '2-digit', minute: '2-digit' })}
@@ -781,16 +837,16 @@ export default function AnalyticsPage() {
                   <Select value={platformFilter} onValueChange={(v) => setPlatformFilter(v ?? 'all')}>
                     <SelectTrigger size="sm" aria-label={t('common.provider')}>
                       <SelectValue>
-                        {(v: string) => (!v || v === 'all' ? t('analytics.allProviders') : v)}
+                        {(v: string) => (!v || v === 'all' ? t('analytics.allProviders') : providerDisplay.get(v) ?? v)}
                       </SelectValue>
                     </SelectTrigger>
                     <SelectContent>
                       <SelectItem value="all">{t('analytics.allProviders')}</SelectItem>
                       {byPlatform.map((p) => (
-                        <SelectItem key={p.platform} value={p.platform}>
+                        <SelectItem key={p.providerId} value={p.providerId}>
                           <span className="flex items-center gap-2">
                             <PlatformDot platform={p.platform} />
-                            <span>{p.platform}</span>
+                            <span>{p.endpoint ?? p.platform}</span>
                           </span>
                         </SelectItem>
                       ))}
@@ -836,7 +892,9 @@ export default function AnalyticsPage() {
                             {r.modelId}
                             {r.requestedModel && r.requestedModel !== r.modelId ? ' *' : ''}
                           </TableCell>
-                          <TableCell className="text-xs text-muted-foreground">{r.platform}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">
+                            {r.platform === 'custom' && r.keyLabel ? r.keyLabel : r.platform}
+                          </TableCell>
                           <TableCell className={`text-xs ${statusTextClass(r.status)}`} title={r.error ?? undefined}>
                             {r.status}
                           </TableCell>
@@ -883,11 +941,11 @@ export default function AnalyticsPage() {
                     </TableHeader>
                     <TableBody>
                       {byPlatform.map((p) => (
-                        <TableRow key={p.platform}>
+                        <TableRow key={p.providerId}>
                           <TableCell className="pl-4 text-sm font-medium">
                             <span className="flex items-center gap-2">
                               <PlatformDot platform={p.platform} />
-                              {p.platform}
+                              {p.endpoint ?? p.platform}
                             </span>
                           </TableCell>
                           <TableCell className="text-right tabular-nums">{p.requests}</TableCell>
@@ -931,10 +989,10 @@ export default function AnalyticsPage() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {byModel.map((m, i) => (
-                        <TableRow key={i}>
+                      {byModel.map((m) => (
+                        <TableRow key={`${m.providerId ?? m.platform}:${m.modelId}`}>
                           <TableCell className="pl-4 text-sm font-medium">{m.displayName}</TableCell>
-                          <TableCell className="text-xs text-muted-foreground">{m.platform}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{m.endpoint ?? m.platform}</TableCell>
                           <TableCell className="text-right tabular-nums">{m.requests}</TableCell>
                           <TableCell className="text-right tabular-nums">{m.pinnedRequests > 0 ? m.pinnedRequests : '—'}</TableCell>
                           <TableCell className="text-right tabular-nums">{m.successRate}%</TableCell>

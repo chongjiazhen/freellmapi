@@ -11,7 +11,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function post(app: Express, path: string, body: any) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -27,7 +28,8 @@ async function post(app: Express, path: string, body: any) {
 }
 
 async function get(app: Express, path: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     headers: isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {},
@@ -38,7 +40,8 @@ async function get(app: Express, path: string) {
 }
 
 async function del(app: Express, path: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'DELETE',
@@ -212,7 +215,7 @@ describe('Custom Provider Endpoints', () => {
         '\n',
       );
     });
-    await new Promise<void>(resolve => upstream.listen(0, resolve));
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
     const upstreamPort = (upstream.address() as any).port;
 
     // Point the custom provider at the NDJSON upstream and pin its model.
@@ -222,7 +225,8 @@ describe('Custom Provider Endpoints', () => {
     });
     expect(reg.status).toBe(201);
 
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as any;
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
       method: 'POST',
